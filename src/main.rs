@@ -110,7 +110,7 @@ fn draw_top_rule(out: &mut Stdout, menu_x: u16) -> io::Result<()> {
     // Draw this last so a terminal that renders the map glyph as two cells
     // cannot push the menu header out of alignment.
     if menu_x >= 3 {
-        print_at(out, menu_x - 3, 0, "🗺")?;
+        print_at(out, menu_x - 3, 0, " 🗺 ")?;
     }
 
     Ok(())
