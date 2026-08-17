@@ -14,6 +14,7 @@ pub enum MenuCommand {
     Parent,
     TreeLayout,
     Spacing,
+    Center,
     Sha256,
     Zip,
     Rename,
@@ -24,23 +25,24 @@ pub enum MenuCommand {
 
 #[derive(Clone, Copy, Debug)]
 pub struct MenuEntry {
-    pub hotkey: char,
+    pub hotkey: Option<char>,
     pub glyph: &'static str,
     pub label: &'static str,
     pub command: MenuCommand,
 }
 
-pub const MENU_ENTRIES: [MenuEntry; 10] = [
-    MenuEntry { hotkey: '0', glyph: "🯰", label: "reload", command: MenuCommand::Reload },
-    MenuEntry { hotkey: '1', glyph: "🯱", label: "parent", command: MenuCommand::Parent },
-    MenuEntry { hotkey: '2', glyph: "🯲", label: "tree layout", command: MenuCommand::TreeLayout },
-    MenuEntry { hotkey: '3', glyph: "🯳", label: "spacing", command: MenuCommand::Spacing },
-    MenuEntry { hotkey: '4', glyph: "🯴", label: "sha256", command: MenuCommand::Sha256 },
-    MenuEntry { hotkey: '5', glyph: "🯵", label: "zip", command: MenuCommand::Zip },
-    MenuEntry { hotkey: '6', glyph: "🯶", label: "rename", command: MenuCommand::Rename },
-    MenuEntry { hotkey: '7', glyph: "🯷", label: "new folder", command: MenuCommand::NewFolder },
-    MenuEntry { hotkey: '8', glyph: "🯸", label: "delete", command: MenuCommand::Delete },
-    MenuEntry { hotkey: '9', glyph: "🯹", label: "exit", command: MenuCommand::Exit },
+pub const MENU_ENTRIES: [MenuEntry; 11] = [
+    MenuEntry { hotkey: Some('0'), glyph: "🯰", label: "reload", command: MenuCommand::Reload },
+    MenuEntry { hotkey: Some('1'), glyph: "🯱", label: "parent", command: MenuCommand::Parent },
+    MenuEntry { hotkey: Some('2'), glyph: "🯲", label: "tree layout", command: MenuCommand::TreeLayout },
+    MenuEntry { hotkey: Some('3'), glyph: "🯳", label: "spacing", command: MenuCommand::Spacing },
+    MenuEntry { hotkey: None, glyph: "⌂", label: "center (home)", command: MenuCommand::Center },
+    MenuEntry { hotkey: Some('4'), glyph: "🯴", label: "sha256", command: MenuCommand::Sha256 },
+    MenuEntry { hotkey: Some('5'), glyph: "🯵", label: "zip", command: MenuCommand::Zip },
+    MenuEntry { hotkey: Some('6'), glyph: "🯶", label: "rename", command: MenuCommand::Rename },
+    MenuEntry { hotkey: Some('7'), glyph: "🯷", label: "new folder", command: MenuCommand::NewFolder },
+    MenuEntry { hotkey: Some('8'), glyph: "🯸", label: "delete", command: MenuCommand::Delete },
+    MenuEntry { hotkey: Some('9'), glyph: "🯹", label: "exit (esc)", command: MenuCommand::Exit },
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -55,14 +57,23 @@ impl Default for MenuState {
 }
 
 impl MenuState {
-    pub fn set_cursor(&mut self, index: usize) {
-        if index < MENU_ENTRIES.len() {
+    pub fn set_cursor(&mut self, index: usize) -> bool {
+        if index < MENU_ENTRIES.len() && self.cursor != index {
             self.cursor = index;
+            true
+        } else {
+            false
         }
     }
 
     pub fn index_for_hotkey(key: char) -> Option<usize> {
-        MENU_ENTRIES.iter().position(|entry| entry.hotkey == key)
+        MENU_ENTRIES
+            .iter()
+            .position(|entry| entry.hotkey == Some(key))
+    }
+
+    pub fn index_for_command(command: MenuCommand) -> Option<usize> {
+        MENU_ENTRIES.iter().position(|entry| entry.command == command)
     }
 
     pub fn row_for_index(index: usize) -> u16 {
@@ -71,12 +82,13 @@ impl MenuState {
             1 => 3,
             2 => 6,
             3 => 7,
-            4 => 10,
+            4 => 8,
             5 => 11,
             6 => 12,
             7 => 13,
             8 => 14,
             9 => 15,
+            10 => 16,
             _ => u16::MAX,
         }
     }
@@ -97,6 +109,7 @@ pub struct Confirmation {
     pub pending: PendingAction,
     pub title: String,
     pub lines: Vec<String>,
+    pub trash_origin_y: Option<u16>,
 }
 
 impl Confirmation {
@@ -110,6 +123,7 @@ impl Confirmation {
                 format!("Move {source_name}"),
                 format!("into {target_name} ?"),
             ],
+            trash_origin_y: None,
         }
     }
 
@@ -122,7 +136,13 @@ impl Confirmation {
                 format!("Move {source_name} to recycle area?"),
                 "Stored in .explorer-trash/".to_string(),
             ],
+            trash_origin_y: None,
         }
+    }
+
+    pub fn with_origin_y(mut self, y: u16) -> Self {
+        self.trash_origin_y = Some(y);
+        self
     }
 }
 
@@ -156,11 +176,15 @@ pub fn dispatch_menu(
         }
         MenuCommand::TreeLayout => {
             graph.center();
-            Ok(Dispatch::Status("VIEW · tree layout · centered".to_string()))
+            Ok(Dispatch::Status("VIEW · tree layout".to_string()))
         }
         MenuCommand::Spacing => {
             let gap = graph.cycle_spacing();
             Ok(Dispatch::Status(format!("VIEW · spacing {gap} columns")))
+        }
+        MenuCommand::Center => {
+            graph.center();
+            Ok(Dispatch::Status("VIEW · centered".to_string()))
         }
         MenuCommand::Sha256 => Ok(Dispatch::Status(
             "ACTION · sha256 callback reserved (std + crossterm only)".to_string(),
@@ -175,7 +199,7 @@ pub fn dispatch_menu(
             "ACTION · new-folder callback reserved for text-input modal".to_string(),
         )),
         MenuCommand::Delete => match selected {
-            Some(0) | None => Ok(Dispatch::Status("DELETE · select one file/folder first".to_string())),
+            None => Ok(Dispatch::Status("DELETE · select one file/folder first".to_string())),
             Some(source) => Ok(Dispatch::Confirm(Confirmation::trash_node(graph, source))),
         },
         MenuCommand::Exit => Ok(Dispatch::Exit),
@@ -198,7 +222,6 @@ pub fn execute_confirmation(
         }
     }
 }
-
 
 #[derive(Clone, Copy)]
 struct ModalGeometry {
@@ -232,7 +255,6 @@ pub fn draw_menu(
     menu_x: u16,
     bottom: u16,
     menu: MenuState,
-    root_label: &str,
     menu_width: u16,
 ) -> io::Result<()> {
     let right = menu_x + menu_width - 1;
@@ -254,28 +276,53 @@ pub fn draw_menu(
     }
     print_at(out, right, bottom, "╯")?;
 
-    menu_text(out, menu_x + 2, 1, "mount", false)?;
-    menu_text(out, menu_x + 2, 5, "view", false)?;
-    menu_text(out, menu_x + 2, 9, "actions", false)?;
+    menu_text(out, menu_x + 2, 1, "mount")?;
+    menu_text(out, menu_x + 2, 5, "view")?;
+    menu_text(out, menu_x + 2, 10, "actions")?;
 
-    for (index, entry) in MENU_ENTRIES.iter().enumerate() {
-        let y = MenuState::row_for_index(index);
-        if y >= bottom {
-            continue;
-        }
-        let is_cursor = menu.cursor == index;
-        let cursor = if is_cursor { "☩" } else { " " };
-        let line = format!("{} {} {:<14}", entry.glyph, cursor, entry.label);
-        menu_text(out, menu_x + 2, y, &line, is_cursor)?;
-    }
-
-    if bottom > 17 {
-        let root = clip_text(root_label, menu_width.saturating_sub(4) as usize);
-        menu_text(out, menu_x + 2, bottom - 2, &root, false)?;
-        menu_text(out, menu_x + 2, bottom - 1, "esc exit · home center", false)?;
+    for index in 0..MENU_ENTRIES.len() {
+        draw_menu_entry(out, menu_x, bottom, menu, menu_width, index)?;
     }
 
     Ok(())
+}
+
+pub fn draw_menu_cursor_only(
+    out: &mut Stdout,
+    menu_x: u16,
+    bottom: u16,
+    menu: MenuState,
+    menu_width: u16,
+    previous: usize,
+) -> io::Result<()> {
+    draw_menu_entry(out, menu_x, bottom, menu, menu_width, previous)?;
+    if menu.cursor != previous {
+        draw_menu_entry(out, menu_x, bottom, menu, menu_width, menu.cursor)?;
+    }
+    Ok(())
+}
+
+fn draw_menu_entry(
+    out: &mut Stdout,
+    menu_x: u16,
+    bottom: u16,
+    menu: MenuState,
+    menu_width: u16,
+    index: usize,
+) -> io::Result<()> {
+    let Some(entry) = MENU_ENTRIES.get(index) else {
+        return Ok(());
+    };
+    let y = MenuState::row_for_index(index);
+    if y >= bottom {
+        return Ok(());
+    }
+
+    let cursor = if menu.cursor == index { "☩" } else { " " };
+    let body = format!("{} {} {}", entry.glyph, cursor, entry.label);
+    let inner_width = menu_width.saturating_sub(4) as usize;
+    let line = format!("{:<width$}", clip_text(&body, inner_width), width = inner_width);
+    menu_text(out, menu_x + 2, y, &line)
 }
 
 pub fn draw_confirmation(
@@ -365,19 +412,11 @@ fn modal_geometry(viewport: Viewport) -> ModalGeometry {
     }
 }
 
-fn menu_text(out: &mut Stdout, x: u16, y: u16, text: &str, active: bool) -> io::Result<()> {
-    if active {
-        queue!(
-            out,
-            SetBackgroundColor(Color::DarkGrey),
-            SetForegroundColor(Color::White)
-        )?;
-    } else {
-        queue!(out, ResetColor)?;
-    }
-    print_at(out, x, y, text)?;
+fn menu_text(out: &mut Stdout, x: u16, y: u16, text: &str) -> io::Result<()> {
+    // The cursor glyph is the sole hover/selection indicator. No menu color
+    // changes are needed, which keeps cursor-only redraws very small.
     queue!(out, ResetColor)?;
-    Ok(())
+    print_at(out, x, y, text)
 }
 
 fn clip_text(text: &str, max: usize) -> String {
