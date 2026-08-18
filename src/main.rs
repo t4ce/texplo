@@ -45,7 +45,7 @@ const MIN_CONTENT_HEIGHT: u16 = 27;
 const TICK: Duration = Duration::from_millis(16);
 const MAX_EVENT_BATCH: usize = 64;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(70);
-const BUILD_ID: &str = "v0.20 · toggle minimap";
+const BUILD_ID: &str = "v0.22 · half-screen overscroll + map scrub";
 const FALL_TICK: Duration = Duration::from_millis(90);
 
 #[derive(Clone, Copy)]
@@ -155,6 +155,7 @@ struct App {
     press: Option<Press>,
     drag: Option<DragState>,
     pan: Option<PanState>,
+    minimap_nav: bool,
     menu: MenuState,
     minimap: Minimap,
     minimap_visible: bool,
@@ -184,6 +185,7 @@ impl App {
             press: None,
             drag: None,
             pan: None,
+            minimap_nav: false,
             menu: MenuState::default(),
             minimap: Minimap::default(),
             minimap_visible: true,
@@ -243,6 +245,7 @@ impl App {
         self.press = None;
         self.drag = None;
         self.pan = None;
+        self.minimap_nav = false;
     }
 
     fn schedule_resize(&mut self) {
@@ -411,20 +414,32 @@ fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
             }
         }
         KeyCode::Left | KeyCode::Char('a') | KeyCode::Char('A') => {
-            app.graph.pan(2, 0);
-            app.mark_dirty();
+            if let Some(layout) = Layout::current(app.diagnostics)? {
+                if app.graph.pan_clamped(layout.viewport, 2, 0) {
+                    app.mark_dirty();
+                }
+            }
         }
         KeyCode::Right | KeyCode::Char('d') | KeyCode::Char('D') => {
-            app.graph.pan(-2, 0);
-            app.mark_dirty();
+            if let Some(layout) = Layout::current(app.diagnostics)? {
+                if app.graph.pan_clamped(layout.viewport, -2, 0) {
+                    app.mark_dirty();
+                }
+            }
         }
         KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('W') => {
-            app.graph.pan(0, 2);
-            app.mark_dirty();
+            if let Some(layout) = Layout::current(app.diagnostics)? {
+                if app.graph.pan_clamped(layout.viewport, 0, 2) {
+                    app.mark_dirty();
+                }
+            }
         }
         KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('S') => {
-            app.graph.pan(0, -2);
-            app.mark_dirty();
+            if let Some(layout) = Layout::current(app.diagnostics)? {
+                if app.graph.pan_clamped(layout.viewport, 0, -2) {
+                    app.mark_dirty();
+                }
+            }
         }
         KeyCode::Enter => {
             if let Some(source) = app.selected {
@@ -556,14 +571,44 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         }
     }
 
+    // Left-dragging the minimap is a navigation scrub. Mouse-down performs
+    // the first jump; subsequent drag events keep mapping the pointer through
+    // the same cached minimap world bounds. No minimap scene rebuild is needed.
+    if app.minimap_nav {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(geometry) = minimap_geometry(app, layout) {
+                    if let Some((world_x, world_y)) = Minimap::world_at(
+                        &app.graph,
+                        geometry,
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        if app.graph.jump_to_world(layout.viewport, world_x, world_y) {
+                            app.mark_dirty();
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            MouseEventKind::Up(_) => {
+                app.minimap_nav = false;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     if let Some(pan) = app.pan {
         match mouse.kind {
             MouseEventKind::Drag(_) => {
                 let dx = mouse.column as i32 - pan.start_x as i32;
                 let dy = mouse.row as i32 - pan.start_y as i32;
                 let next = (pan.camera_x + dx * 2, pan.camera_y + dy * 2);
-                if app.graph.camera() != next {
-                    app.graph.set_camera(next.0, next.1);
+                if app
+                    .graph
+                    .set_camera_clamped(layout.viewport, next.0, next.1)
+                {
                     app.mark_dirty();
                 }
                 return Ok(());
@@ -628,9 +673,23 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         MouseEventKind::Down(MouseButton::Left)
             if layout.viewport.contains(mouse.column, mouse.row) =>
         {
-            if minimap_hit(app, layout, mouse.column, mouse.row) {
-                app.press = None;
-                return Ok(());
+            if let Some(geometry) = minimap_geometry(app, layout) {
+                if geometry.contains(mouse.column, mouse.row) {
+                    if let Some((world_x, world_y)) = Minimap::world_at(
+                        &app.graph,
+                        geometry,
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        if app.graph.jump_to_world(layout.viewport, world_x, world_y) {
+                            app.mark_dirty();
+                        }
+                    }
+                    app.minimap_nav = true;
+                    app.press = None;
+                    app.drag = None;
+                    return Ok(());
+                }
             }
             if let Some(node) = app
                 .graph
@@ -728,13 +787,11 @@ fn is_trash_column(x: u16) -> bool {
     x < DROP_HIT_WIDTH
 }
 
-fn minimap_hit(app: &App, layout: Layout, x: u16, y: u16) -> bool {
+fn minimap_geometry(app: &App, layout: Layout) -> Option<minimap::MinimapGeometry> {
     if !app.minimap_visible {
-        return false;
+        return None;
     }
-    let Ok((width, height)) = terminal::size() else {
-        return false;
-    };
+    let (width, height) = terminal::size().ok()?;
     Minimap::geometry(
         width,
         height,
@@ -742,8 +799,12 @@ fn minimap_hit(app: &App, layout: Layout, x: u16, y: u16) -> bool {
         MIN_WIDTH,
         Layout::minimum_height(app.diagnostics),
     )
-    .map(|geometry| geometry.contains(x, y))
-    .unwrap_or(false)
+}
+
+fn minimap_hit(app: &App, layout: Layout, x: u16, y: u16) -> bool {
+    minimap_geometry(app, layout)
+        .map(|geometry| geometry.contains(x, y))
+        .unwrap_or(false)
 }
 
 fn add_link(app: &mut App, node_id: usize) {
@@ -965,6 +1026,11 @@ fn compose_frame(app: &mut App) -> io::Result<Frame> {
         );
         return Ok(frame);
     };
+
+    // Resize changes the viewport and therefore the legal camera rectangle.
+    // Clamp once before composing so a formerly valid camera can never reveal
+    // empty space after the terminal becomes larger.
+    app.graph.clamp_camera(layout.viewport);
 
     draw_top_rule(&mut frame, app, layout.menu_x);
     draw_canvas_frame(&mut frame, layout.canvas_bottom_y);

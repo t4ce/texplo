@@ -44,6 +44,14 @@ impl Viewport {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct WorldBounds {
+    pub min_x: i32,
+    pub max_x: i32,
+    pub min_y: i32,
+    pub max_y: i32,
+}
+
 #[derive(Clone, Debug)]
 pub struct FsNode {
     pub id: usize,
@@ -445,14 +453,110 @@ impl GraphView {
         (self.camera_x, self.camera_y)
     }
 
-    pub fn set_camera(&mut self, x: i32, y: i32) {
-        self.camera_x = x;
-        self.camera_y = y;
+    /// World-space bounds of everything that can contribute pixels/cells to the
+    /// graph: visible labels/tombstones/placeholders plus cached Braille edges.
+    /// The hidden structural mount root is deliberately excluded.
+    pub fn content_bounds(&self) -> Option<WorldBounds> {
+        let mut bounds: Option<WorldBounds> = None;
+
+        let mut include = |x0: i32, x1: i32, y0: i32, y1: i32| {
+            bounds = Some(match bounds {
+                Some(mut b) => {
+                    b.min_x = b.min_x.min(x0);
+                    b.max_x = b.max_x.max(x1);
+                    b.min_y = b.min_y.min(y0);
+                    b.max_y = b.max_y.max(y1);
+                    b
+                }
+                None => WorldBounds {
+                    min_x: x0,
+                    max_x: x1,
+                    min_y: y0,
+                    max_y: y1,
+                },
+            });
+        };
+
+        for node in &self.nodes {
+            if node.id == 0 || node.hidden {
+                continue;
+            }
+            let Some(pos) = self.positions.get(node.id).copied() else {
+                continue;
+            };
+            let width = self.node_width(node.id).max(1) as i32;
+            include(pos.x, pos.x + width - 1, pos.y, pos.y);
+        }
+
+        for cell in &self.edge_cells {
+            include(cell.x, cell.x, cell.y, cell.y);
+        }
+
+        bounds
     }
 
-    pub fn pan(&mut self, dx: i32, dy: i32) {
-        self.camera_x += dx;
-        self.camera_y += dy;
+    /// Camera limits derived from the current content rectangle and viewport.
+    ///
+    /// The user may deliberately overscroll away from the graph, but only by
+    /// half of the currently visible graph viewport on each axis. This keeps
+    /// navigation forgiving without allowing the camera to disappear into
+    /// effectively unbounded empty space. Camera zero is always valid.
+    pub fn camera_limits(&self, viewport: Viewport) -> ((i32, i32), (i32, i32)) {
+        let Some(bounds) = self.content_bounds() else {
+            return ((0, 0), (0, 0));
+        };
+        let (origin_x, origin_y) = self.screen_origin(viewport);
+
+        // Baseline: content can reach the viewport edge. Then extend that legal
+        // range by exactly half the visible width/height as soft overscroll.
+        let left_aligned = viewport.x as i32 - origin_x - bounds.min_x;
+        let right_aligned = viewport.right() as i32 - 1 - origin_x - bounds.max_x;
+        let top_aligned = viewport.y as i32 - origin_y - bounds.min_y;
+        let bottom_aligned = viewport.bottom() as i32 - 1 - origin_y - bounds.max_y;
+
+        let overscroll_x = viewport.width as i32 / 2;
+        let overscroll_y = viewport.height as i32 / 2;
+
+        let min_x = right_aligned.saturating_sub(overscroll_x).min(0);
+        let max_x = left_aligned.saturating_add(overscroll_x).max(0);
+        let min_y = bottom_aligned.saturating_sub(overscroll_y).min(0);
+        let max_y = top_aligned.saturating_add(overscroll_y).max(0);
+        ((min_x, max_x), (min_y, max_y))
+    }
+
+    pub fn set_camera_clamped(&mut self, viewport: Viewport, x: i32, y: i32) -> bool {
+        let ((min_x, max_x), (min_y, max_y)) = self.camera_limits(viewport);
+        let next_x = x.clamp(min_x, max_x);
+        let next_y = y.clamp(min_y, max_y);
+        let changed = (next_x, next_y) != (self.camera_x, self.camera_y);
+        self.camera_x = next_x;
+        self.camera_y = next_y;
+        changed
+    }
+
+    pub fn clamp_camera(&mut self, viewport: Viewport) -> bool {
+        self.set_camera_clamped(viewport, self.camera_x, self.camera_y)
+    }
+
+    pub fn pan_clamped(&mut self, viewport: Viewport, dx: i32, dy: i32) -> bool {
+        self.set_camera_clamped(
+            viewport,
+            self.camera_x.saturating_add(dx),
+            self.camera_y.saturating_add(dy),
+        )
+    }
+
+    /// Place a world-space point at the center of the current viewport, then
+    /// clamp the result to the same content rectangle used by normal panning.
+    pub fn jump_to_world(&mut self, viewport: Viewport, world_x: i32, world_y: i32) -> bool {
+        let (origin_x, origin_y) = self.screen_origin(viewport);
+        let center_x = viewport.x as i32 + viewport.width as i32 / 2;
+        let center_y = viewport.y as i32 + viewport.height as i32 / 2;
+        self.set_camera_clamped(
+            viewport,
+            center_x - origin_x - world_x,
+            center_y - origin_y - world_y,
+        )
     }
 
 

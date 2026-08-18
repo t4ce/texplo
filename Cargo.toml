@@ -11,6 +11,7 @@ trueos = { path = "../TRUEOS-Blueprints/api", features = ["tokio-runtime"] }
 
 [patch.crates-io]
 mio = { path = "../TRUEOS-Blueprints/vendor/mio-1.2.0" }
+rustix = { path = "../TRUEOS-Blueprints/vendor/rustix-1.1.4-trueos" }
 signal-hook-mio = { path = "../TRUEOS-Blueprints/vendor/signal-hook-mio-0.2.5-trueos" }
 
 [profile.dev]

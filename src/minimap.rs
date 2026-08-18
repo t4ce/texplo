@@ -70,6 +70,38 @@ impl Minimap {
         })
     }
 
+    /// Translate a click in the framed minimap to the corresponding world-space
+    /// point. This uses the exact same sample bounds as the density raster, so a
+    /// click is relative to what the user sees rather than to camera state.
+    pub fn world_at(
+        graph: &GraphView,
+        geometry: MinimapGeometry,
+        x: u16,
+        y: u16,
+    ) -> Option<(i32, i32)> {
+        let inner_width = geometry.width.saturating_sub(2);
+        let inner_height = geometry.height.saturating_sub(2);
+        if inner_width == 0 || inner_height == 0 {
+            return None;
+        }
+
+        let samples = graph.minimap_samples();
+        let (min_x, max_x, min_y, max_y) = sample_bounds(&samples)?;
+
+        // Border clicks snap to the nearest point inside the minimap instead of
+        // becoming dead zones. This makes the complete visible map clickable.
+        let local_x = x
+            .saturating_sub(geometry.x.saturating_add(1))
+            .min(inner_width.saturating_sub(1));
+        let local_y = y
+            .saturating_sub(geometry.y.saturating_add(1))
+            .min(inner_height.saturating_sub(1));
+
+        let world_x = interpolate_axis(local_x, inner_width, min_x, max_x);
+        let world_y = interpolate_axis(local_y, inner_height, min_y, max_y);
+        Some((world_x, world_y))
+    }
+
     pub fn draw(
         &mut self,
         frame: &mut Frame,
@@ -162,14 +194,9 @@ fn rasterize(graph: &GraphView, width: u16, height: u16) -> Vec<char> {
         return vec![' '; len];
     }
 
-    let (mut min_x, mut max_x) = (samples[0].0, samples[0].0);
-    let (mut min_y, mut max_y) = (samples[0].1, samples[0].1);
-    for &(x, y) in &samples[1..] {
-        min_x = min_x.min(x);
-        max_x = max_x.max(x);
-        min_y = min_y.min(y);
-        max_y = max_y.max(y);
-    }
+    let Some((min_x, max_x, min_y, max_y)) = sample_bounds(&samples) else {
+        return vec![' '; len];
+    };
 
     let dot_width = (width as i32 * 2).max(1);
     let dot_height = (height as i32 * 4).max(1);
@@ -208,6 +235,28 @@ fn rasterize(graph: &GraphView, width: u16, height: u16) -> Vec<char> {
             }
         })
         .collect()
+}
+
+fn sample_bounds(samples: &[(i32, i32)]) -> Option<(i32, i32, i32, i32)> {
+    let &(first_x, first_y) = samples.first()?;
+    let (mut min_x, mut max_x) = (first_x, first_x);
+    let (mut min_y, mut max_y) = (first_y, first_y);
+    for &(x, y) in &samples[1..] {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    Some((min_x, max_x, min_y, max_y))
+}
+
+fn interpolate_axis(local: u16, cells: u16, min: i32, max: i32) -> i32 {
+    if max == min || cells <= 1 {
+        return min + (max - min) / 2;
+    }
+    let denominator = cells.saturating_sub(1) as i64;
+    let span = (max - min) as i64;
+    min + ((local as i64 * span) / denominator) as i32
 }
 
 fn braille_bit(x: usize, y: usize) -> u8 {
