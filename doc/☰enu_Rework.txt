@@ -24,7 +24,7 @@
 ╰─────────────╯
 
 Toggle, up to 8 Toggles, can adjust to skip for eg, 2 state only need ▁ and  █ ::::: ▁ → ▂ → ▃ → ▄ → ▅ → ▆ → ▇ → █
-
+⚚	9882	269A	STAFF OF HERMES	
 
 │🯱   depth  ╭▇╮
 │🯲   space  ┝▂┥
