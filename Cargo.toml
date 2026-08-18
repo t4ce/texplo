@@ -1,7 +1,23 @@
 [package]
-name = "explorer_tui_v14"
+name = "texplo"
 version = "0.14.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-crossterm = "0.29"
+crossterm = { path = "vendor/crossterm-0.29.0", default-features = false, features = ["events"] }
+
+[target.'cfg(any(target_os = "trueos", target_os = "zkvm"))'.dependencies]
+trueos = { path = "../TRUEOS-Blueprints/api", features = ["tokio-runtime"] }
+
+[patch.crates-io]
+signal-hook-mio = { path = "vendor/signal-hook-mio-0.2.5" }
+
+[profile.dev]
+codegen-units = 1         
+debug = "full"            
+lto = true                
+opt-level = 3        
+panic = "abort"           
+split-debuginfo = "packed"
+strip = "symbols"         
+incremental = true        

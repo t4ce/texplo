@@ -1,7 +1,8 @@
 use std::{
     io,
-    path::PathBuf,
 };
+
+use crate::path::PathBuf;
 
 use crossterm::style::Color;
 

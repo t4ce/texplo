@@ -2,10 +2,11 @@ use std::{
     collections::HashMap,
     fs,
     io,
-    path::{Path, PathBuf},
 };
 
 use crossterm::style::Color;
+
+use crate::path::{Path, PathBuf};
 
 use crate::{
     layout::{self, LayoutMode, LayoutNode, WorldPos},

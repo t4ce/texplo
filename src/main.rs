@@ -2,6 +2,7 @@ mod actions;
 mod graph_view;
 mod layout;
 mod screen;
+mod path;
 
 use std::{
     collections::VecDeque,
