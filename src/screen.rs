@@ -3,7 +3,7 @@ use std::io::{self, Stdout, Write};
 use crossterm::{
     cursor::MoveTo,
     queue,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{Clear, ClearType},
 };
 
@@ -11,11 +11,23 @@ use crossterm::{
 pub struct Style {
     pub fg: Color,
     pub bg: Color,
+    pub bold: bool,
+    pub underline: bool,
 }
 
 impl Style {
     pub const fn new(fg: Color, bg: Color) -> Self {
-        Self { fg, bg }
+        Self { fg, bg, bold: false, underline: false }
+    }
+
+    pub const fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+
+    pub const fn underline(mut self) -> Self {
+        self.underline = true;
+        self
     }
 }
 
@@ -26,11 +38,11 @@ impl Default for Style {
 }
 
 // Crossterm deliberately does not ship a Unicode-width table. The UI only has
-// one glyph that must be treated as a guaranteed two-cell terminal glyph for
-// retained rendering: the tombstone emoji. Keep this tiny and dependency-free.
+// a tiny set of glyphs whose display width matters to retained rendering.
+// Keep the table intentionally local and dependency-free.
 pub fn terminal_cell_width(ch: char) -> u16 {
     match ch {
-        '🪦' => 2,
+        '🪦' | '☰' | 'Ｎ' | 'Ｕ' | '＃' => 2,
         _ => 1,
     }
 }
@@ -230,7 +242,7 @@ impl Renderer {
             Some(previous) => self.paint_diff(out, previous, &next)?,
         }
 
-        queue!(out, ResetColor)?;
+        queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
         out.flush()?;
         self.previous = Some(next);
         Ok(())
@@ -386,8 +398,15 @@ fn paint_run(out: &mut Stdout, x: u16, y: u16, style: Style, text: &str) -> io::
     queue!(
         out,
         MoveTo(x, y),
+        SetAttribute(Attribute::Reset),
         SetForegroundColor(style.fg),
         SetBackgroundColor(style.bg),
-        Print(text)
-    )
+    )?;
+    if style.bold {
+        queue!(out, SetAttribute(Attribute::Bold))?;
+    }
+    if style.underline {
+        queue!(out, SetAttribute(Attribute::Underlined))?;
+    }
+    queue!(out, Print(text))
 }

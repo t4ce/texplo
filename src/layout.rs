@@ -225,8 +225,11 @@ impl TreeEngine<'_> {
             bottom = bottom.max(placed.bottom_y);
             max_x = max_x.max(placed.max_x);
 
-            // Zero empty rows between compact file/subtree blocks is allowed.
-            cursor = placed.bottom_y + 1;
+            // Files may remain directly adjacent. A folder owns a visual
+            // subtree/island, so leave one empty row after its full extent before
+            // placing the next sibling block. This keeps neighbouring hierarchy
+            // groups from visually welding together without bloating file lists.
+            cursor = placed.bottom_y + if self.nodes[child].is_dir { 2 } else { 1 };
         }
 
         let first = first_root.unwrap_or(top_y);

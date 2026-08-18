@@ -1,25 +1,22 @@
 mod actions;
 mod graph_view;
 mod layout;
+mod menu_view;
+mod minimap;
 mod screen;
-mod path;
 
 use std::{
     collections::VecDeque,
     env,
     io::{self, stdout},
+    path::{Component, Path, PathBuf, MAIN_SEPARATOR},
     time::{Duration, Instant},
 };
 
 use actions::{
-    dispatch_menu, draw_menu, draw_modal, execute_modal, link_index_for_row, modal_click,
-    Dispatch, MenuContext, MenuLink, MenuState, Modal, PendingAction, MENU_ENTRIES,
+    dispatch_menu, draw_modal, execute_modal, modal_click,
+    Dispatch, MenuContext, MenuLink, MenuSection, MenuState, Modal, PendingAction, MENU_ENTRIES,
 };
-
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-use trueos::{platform, vshell, vsys};
-
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
 use crossterm::{
     cursor::{Hide, Show},
     event::{
@@ -27,31 +24,29 @@ use crossterm::{
         MouseEvent, MouseEventKind,
     },
     execute,
-    style::ResetColor,
+    style::{Color, ResetColor},
     terminal::{
         self, DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
-use crossterm::style::Color;
-use graph_view::{GraphView, Viewport};
-use screen::{Frame, Renderer, Style};
+use graph_view::{GraphView, SelectionStats, Viewport};
+use menu_view::{close_button_hit, draw_menu, link_index_for_row};
+use minimap::Minimap;
+use screen::{terminal_cell_width, text_cell_width, Frame, Renderer, Style};
 
 const DROP_X: u16 = 0;
 const DROP_HIT_WIDTH: u16 = 3; // virtual hit area: columns 0, 1, and 2
 const FRAME_X: u16 = 2;
 const CANVAS_X: u16 = FRAME_X + 1;
-const MENU_WIDTH: u16 = 26;
+const MENU_WIDTH: u16 = 17;
 const LOG_ROWS: u16 = 6;
-const MIN_WIDTH: u16 = 58;
-const MIN_CONTENT_HEIGHT: u16 = 18;
+const MIN_WIDTH: u16 = 60;
+const MIN_CONTENT_HEIGHT: u16 = 27;
 const TICK: Duration = Duration::from_millis(16);
 const MAX_EVENT_BATCH: usize = 64;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(70);
-const BUILD_ID: &str = "v0.14 · wide-cell tombstones";
+const BUILD_ID: &str = "v0.20 · toggle minimap";
 const FALL_TICK: Duration = Duration::from_millis(90);
-const TERMINAL_EXIT_BYTE: u8 = 0x11;
-const TERMINAL_WAIT_BYTE: u8 = 0x12;
-const TERMINAL_REENTRY_BYTE: u8 = 0x1f;
 
 #[derive(Clone, Copy)]
 struct Config {
@@ -89,7 +84,6 @@ impl Config {
 struct TerminalGuard;
 
 impl TerminalGuard {
-    #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
 
@@ -108,9 +102,7 @@ impl TerminalGuard {
     }
 }
 
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
 impl Drop for TerminalGuard {
-    #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
     fn drop(&mut self) {
         let _ = execute!(
             stdout(),
@@ -122,46 +114,6 @@ impl Drop for TerminalGuard {
         );
         let _ = terminal::disable_raw_mode();
     }
-}
-
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-#[derive(Clone, Copy)]
-enum InputKey {
-    Backspace,
-    Char(char),
-    Delete,
-    Down,
-    Esc,
-    Enter,
-    Home,
-    Left,
-    Right,
-    Tab,
-    Up,
-    BackTab,
-}
-
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
-#[derive(Clone, Copy)]
-enum InputKey {
-    Backspace,
-    BackTab,
-    Char(char),
-    Delete,
-    Down,
-    Esc,
-    Enter,
-    Home,
-    Left,
-    Right,
-    Tab,
-    Up,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ResumeMode {
-    Exit,
-    WaitReentry,
 }
 
 #[derive(Clone, Copy)]
@@ -198,10 +150,14 @@ struct FallingGhost {
 struct App {
     graph: GraphView,
     selected: Option<usize>,
+    selected_stats: Option<SelectionStats>,
+    path_hover: Option<PathBuf>,
     press: Option<Press>,
     drag: Option<DragState>,
     pan: Option<PanState>,
     menu: MenuState,
+    minimap: Minimap,
+    minimap_visible: bool,
     modal: Option<Modal>,
     logs: VecDeque<String>,
     falling: Option<FallingGhost>,
@@ -223,10 +179,14 @@ impl App {
         Ok(Self {
             graph,
             selected: None,
+            selected_stats: None,
+            path_hover: None,
             press: None,
             drag: None,
             pan: None,
             menu: MenuState::default(),
+            minimap: Minimap::default(),
+            minimap_visible: true,
             modal: None,
             logs,
             falling: None,
@@ -236,6 +196,25 @@ impl App {
             should_exit: false,
             dirty: true,
         })
+    }
+
+    fn set_selected(&mut self, selected: Option<usize>) -> bool {
+        let changed = self.selected != selected;
+        self.selected = selected;
+        self.selected_stats = selected.and_then(|id| self.graph.selection_stats(id));
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    fn set_path_hover(&mut self, path: Option<PathBuf>) -> bool {
+        if self.path_hover == path {
+            return false;
+        }
+        self.path_hover = path;
+        self.dirty = true;
+        true
     }
 
     fn menu_context(&self) -> MenuContext {
@@ -297,7 +276,7 @@ impl Layout {
     }
 
     fn current(diagnostics: bool) -> io::Result<Option<Self>> {
-        let (width, height) = terminal_dimensions()?;
+        let (width, height) = terminal::size()?;
         if width < MIN_WIDTH || height < Self::minimum_height(diagnostics) {
             return Ok(None);
         }
@@ -323,7 +302,6 @@ impl Layout {
     }
 }
 
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
 fn main() -> io::Result<()> {
     let config = Config::from_args();
     let _terminal = TerminalGuard::enter()?;
@@ -337,7 +315,7 @@ fn main() -> io::Result<()> {
         update_animation(&mut app, now);
 
         if app.dirty && app.resize_deadline.is_none() {
-            let frame = compose_frame(&app)?;
+            let frame = compose_frame(&mut app)?;
             renderer.present(&mut out, frame)?;
             app.dirty = false;
         }
@@ -364,95 +342,17 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-fn main() -> io::Result<()> {
-    let config = Config::from_args();
-    let mut out = stdout();
-    let mut renderer = Renderer::default();
-    let mut app = App::new(config)?;
-
-    loop {
-        let mut mode = ResumeMode::Exit;
-        let mut last_cols = 0u32;
-        let mut last_rows = 0u32;
-        app.mark_dirty();
-
-        trueos_terminal_enter();
-        if let Some(size) = vshell::konsole_size() {
-            last_cols = size.cols;
-            last_rows = size.rows;
-        }
-
-        'session: loop {
-            let now = Instant::now();
-            update_trueos_resize(&mut app, &mut last_cols, &mut last_rows);
-            app.update_resize(now);
-            update_animation(&mut app, now);
-
-            if app.dirty && app.resize_deadline.is_none() {
-                let frame = compose_frame(&app)?;
-                renderer.present(&mut out, frame)?;
-                app.dirty = false;
-            }
-
-            if app.should_exit {
-                mode = ResumeMode::Exit;
-                break 'session;
-            }
-
-            match vshell::attached_read_byte() {
-                Some(TERMINAL_EXIT_BYTE) => {
-                    mode = ResumeMode::Exit;
-                    break 'session;
-                }
-                Some(TERMINAL_WAIT_BYTE) => {
-                    mode = ResumeMode::WaitReentry;
-                    break 'session;
-                }
-                Some(TERMINAL_REENTRY_BYTE) => {
-                    mode = ResumeMode::WaitReentry;
-                    break 'session;
-                }
-                Some(byte) => {
-                    if let Some(key) = trueos_byte_to_key(byte) {
-                        handle_key(&mut app, key)?;
-                    }
-                }
-                None => {}
-            }
-
-            platform::poll_once();
-            vsys::sleep_ms(5);
-        }
-
-        trueos_terminal_exit(mode == ResumeMode::Exit);
-        if mode == ResumeMode::Exit {
-            return Ok(());
-        }
-
-        if trueos_wait_for_terminal_reentry() {
-            return Ok(());
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
 fn handle_event(app: &mut App, event: Event) -> io::Result<()> {
     match event {
         Event::Resize(_, _) => app.schedule_resize(),
-        Event::Key(key) if key.kind == KeyEventKind::Press => {
-            if let Some(key) = key_code_to_input_key(key.code) {
-                handle_key(app, key)?;
-            }
-        }
+        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key.code)?,
         Event::Mouse(mouse) => handle_mouse(app, mouse)?,
         _ => {}
     }
     Ok(())
 }
 
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
-fn handle_key(app: &mut App, code: InputKey) -> io::Result<()> {
+fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
     if app.modal.is_some() {
         let is_input = app
             .modal
@@ -461,9 +361,9 @@ fn handle_key(app: &mut App, code: InputKey) -> io::Result<()> {
             .unwrap_or(false);
         if is_input {
             match code {
-                InputKey::Enter => confirm_modal(app, true)?,
-                InputKey::Esc => confirm_modal(app, false)?,
-                InputKey::Backspace => {
+                KeyCode::Enter => confirm_modal(app, true)?,
+                KeyCode::Esc => confirm_modal(app, false)?,
+                KeyCode::Backspace => {
                     let changed = app
                         .modal
                         .as_mut()
@@ -473,7 +373,7 @@ fn handle_key(app: &mut App, code: InputKey) -> io::Result<()> {
                         app.mark_dirty();
                     }
                 }
-                InputKey::Char(ch) => {
+                KeyCode::Char(ch) => {
                     let changed = app
                         .modal
                         .as_mut()
@@ -487,10 +387,10 @@ fn handle_key(app: &mut App, code: InputKey) -> io::Result<()> {
             }
         } else {
             match code {
-                InputKey::Char('y') | InputKey::Char('Y') | InputKey::Enter => {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     confirm_modal(app, true)?
                 }
-                InputKey::Char('n') | InputKey::Char('N') | InputKey::Esc => {
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     confirm_modal(app, false)?
                 }
                 _ => {}
@@ -500,54 +400,47 @@ fn handle_key(app: &mut App, code: InputKey) -> io::Result<()> {
     }
 
     match code {
-        InputKey::Esc => app.should_exit = true,
-        InputKey::Tab => {
-            let context = app.menu_context();
-            if app.menu.cycle_section(false, context) {
-                app.mark_dirty();
-            }
-        }
-        InputKey::BackTab => {
-            let context = app.menu_context();
-            if app.menu.cycle_section(true, context) {
-                app.mark_dirty();
-            }
-        }
-        InputKey::Home => {
+        KeyCode::Esc => app.should_exit = true,
+        KeyCode::Tab => cycle_menu_section(app, false),
+        KeyCode::BackTab => cycle_menu_section(app, true),
+        KeyCode::Home => {
             if let Some(index) = MenuState::index_for_command(actions::MenuCommand::Center) {
                 let context = app.menu_context();
                 app.menu.set_cursor(index, context);
                 invoke_menu(app, index)?;
             }
         }
-        InputKey::Left
-        | InputKey::Char('a')
-        | InputKey::Char('A') => {
+        KeyCode::Left | KeyCode::Char('a') | KeyCode::Char('A') => {
             app.graph.pan(2, 0);
             app.mark_dirty();
         }
-        InputKey::Right
-        | InputKey::Char('d')
-        | InputKey::Char('D') => {
+        KeyCode::Right | KeyCode::Char('d') | KeyCode::Char('D') => {
             app.graph.pan(-2, 0);
             app.mark_dirty();
         }
-        InputKey::Up | InputKey::Char('w') | InputKey::Char('W') => {
+        KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('W') => {
             app.graph.pan(0, 2);
             app.mark_dirty();
         }
-        InputKey::Down | InputKey::Char('s') | InputKey::Char('S') => {
+        KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('S') => {
             app.graph.pan(0, -2);
             app.mark_dirty();
         }
-        InputKey::Enter => {
-            if app.menu_context() == MenuContext::Folder {
-                if let Some(index) = MenuState::index_for_command(actions::MenuCommand::Enter) {
-                    invoke_menu(app, index)?;
+        KeyCode::Enter => {
+            if let Some(source) = app.selected {
+                if app.graph.node(source).map(|node| node.is_dir).unwrap_or(false) {
+                    match app.graph.mount_node(source) {
+                        Ok(()) => {
+                            app.set_selected(None);
+                            app.clear_transient();
+                            app.log(format!("MOUNT · {}", app.graph.root_label()));
+                        }
+                        Err(err) => app.log(format!("ENTER FAILED · {err}")),
+                    }
                 }
             }
         }
-        InputKey::Delete | InputKey::Backspace => {
+        KeyCode::Delete | KeyCode::Backspace => {
             if let Some(source) = app.selected.filter(|id| *id != 0) {
                 let mut modal = Modal::trash_node(&app.graph, source);
                 if let Some(y) = selected_screen_y(app, source) {
@@ -557,9 +450,30 @@ fn handle_key(app: &mut App, code: InputKey) -> io::Result<()> {
                 app.mark_dirty();
             }
         }
-        InputKey::Char(ch) if ch.is_ascii_digit() => {
+        KeyCode::Char(ch) if ch.is_ascii_digit() => {
             let context = app.menu_context();
-            if let Some(index) = app.menu.index_for_hotkey(ch, context) {
+            if app.menu.section == MenuSection::Clip {
+                let visible = Layout::current(app.diagnostics)
+                    .ok()
+                    .flatten()
+                    .map(|layout| {
+                        MenuState::clip_visible_count(
+                            layout.separator_y,
+                            context,
+                            app.links.len(),
+                        )
+                    })
+                    .unwrap_or(0);
+                if let Some(link_index) = app
+                    .menu
+                    .clip_index_for_hotkey(ch, app.links.len(), visible)
+                {
+                    app.menu.set_clip_cursor(link_index, app.links.len());
+                    open_link(app, link_index)?;
+                } else if ch == '0' && app.links.is_empty() && visible > 0 {
+                    app.log("CLIP · Empty");
+                }
+            } else if let Some(index) = app.menu.index_for_hotkey(ch, context) {
                 app.menu.set_cursor(index, context);
                 invoke_menu(app, index)?;
             }
@@ -569,208 +483,26 @@ fn handle_key(app: &mut App, code: InputKey) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-fn handle_key(app: &mut App, code: InputKey) -> io::Result<()> {
-    if app.modal.is_some() {
-        let is_input = app
-            .modal
-            .as_ref()
-            .map(|modal| modal.is_input())
-            .unwrap_or(false);
-        if is_input {
-            match code {
-                InputKey::Enter => confirm_modal(app, true)?,
-                InputKey::Esc => confirm_modal(app, false)?,
-                InputKey::Backspace => {
-                    let changed = app
-                        .modal
-                        .as_mut()
-                        .map(|modal| modal.backspace())
-                        .unwrap_or(false);
-                    if changed {
-                        app.mark_dirty();
-                    }
-                }
-                InputKey::Char(ch) => {
-                    let changed = app
-                        .modal
-                        .as_mut()
-                        .map(|modal| modal.push_char(ch))
-                        .unwrap_or(false);
-                    if changed {
-                        app.mark_dirty();
-                    }
-                }
-                _ => {}
-            }
-        } else {
-            match code {
-                InputKey::Char('y') | InputKey::Char('Y') | InputKey::Enter => {
-                    confirm_modal(app, true)?
-                }
-                InputKey::Char('n') | InputKey::Char('N') | InputKey::Esc => {
-                    confirm_modal(app, false)?
-                }
-                _ => {}
-            }
+fn cycle_menu_section(app: &mut App, reverse: bool) {
+    let context = app.menu_context();
+    let mut changed = app.menu.cycle_section(reverse, context);
+    if app.menu.section == MenuSection::Clip {
+        let clip_visible = Layout::current(app.diagnostics)
+            .ok()
+            .flatten()
+            .and_then(|layout| {
+                MenuState::clip_header_row(layout.separator_y, context, app.links.len())
+            })
+            .is_some();
+        if !clip_visible {
+            changed |= app.menu.cycle_section(reverse, context);
         }
-        return Ok(());
     }
-
-    match code {
-        InputKey::Esc => app.should_exit = true,
-        InputKey::Char('\t') | InputKey::Tab => {
-            if app.menu.cycle_section(false, app.menu_context()) {
-                app.mark_dirty();
-            }
-        }
-        InputKey::Home => {
-            if let Some(index) = MenuState::index_for_command(actions::MenuCommand::Center) {
-                app.menu.set_cursor(index, app.menu_context());
-                invoke_menu(app, index)?;
-            }
-        }
-        InputKey::Left => {
-            app.graph.pan(2, 0);
-            app.mark_dirty();
-        }
-        InputKey::Right => {
-            app.graph.pan(-2, 0);
-            app.mark_dirty();
-        }
-        InputKey::Up => {
-            app.graph.pan(0, 2);
-            app.mark_dirty();
-        }
-        InputKey::Down => {
-            app.graph.pan(0, -2);
-            app.mark_dirty();
-        }
-        InputKey::Enter => {
-            if app.menu_context() == MenuContext::Folder {
-                if let Some(index) = MenuState::index_for_command(actions::MenuCommand::Enter) {
-                    invoke_menu(app, index)?;
-                }
-            }
-        }
-        InputKey::Delete | InputKey::Backspace => {
-            if let Some(source) = app.selected.filter(|id| *id != 0) {
-                let mut modal = Modal::trash_node(&app.graph, source);
-                if let Some(y) = selected_screen_y(app, source) {
-                    modal = modal.with_origin_y(y);
-                }
-                app.modal = Some(modal);
-                app.mark_dirty();
-            }
-        }
-        InputKey::Char(ch) if ch.is_ascii_digit() => {
-            let context = app.menu_context();
-            if let Some(index) = app.menu.index_for_hotkey(ch, context) {
-                app.menu.set_cursor(index, context);
-                invoke_menu(app, index)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
-fn key_code_to_input_key(code: KeyCode) -> Option<InputKey> {
-    match code {
-        KeyCode::BackTab => Some(InputKey::BackTab),
-        KeyCode::Backspace => Some(InputKey::Backspace),
-        KeyCode::Delete => Some(InputKey::Delete),
-        KeyCode::Down => Some(InputKey::Down),
-        KeyCode::Esc => Some(InputKey::Esc),
-        KeyCode::Enter => Some(InputKey::Enter),
-        KeyCode::Home => Some(InputKey::Home),
-        KeyCode::Left => Some(InputKey::Left),
-        KeyCode::Right => Some(InputKey::Right),
-        KeyCode::Tab => Some(InputKey::Tab),
-        KeyCode::Up => Some(InputKey::Up),
-        KeyCode::Char(ch) => Some(InputKey::Char(ch)),
-        _ => None,
+    if changed {
+        app.mark_dirty();
     }
 }
 
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-fn trueos_terminal_enter() {
-    let size = vshell::konsole_size().unwrap_or(vshell::KonsoleSize {
-        cols: 80,
-        rows: 24,
-    });
-    let _ = vshell::konsole_begin_frame(
-        size.cols,
-        size.rows,
-        vshell::KONSOLE_FRAME_TERMINAL_HANDOFF,
-    );
-    let _ = vshell::attached_write(b"\x1b[?1049h\x1b[?25h");
-}
-
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-fn trueos_terminal_exit(full_exit: bool) {
-    let _ = vshell::attached_write(b"\x1b[?1049l\x1b[?25h\x1b[2J\x1b[H");
-    let _ = vshell::konsole_end_frame();
-    vshell::leave_terminal_handoff();
-    if full_exit {
-        let _ = vshell::shutdown_current_blueprint("texplo terminated");
-    }
-}
-
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-fn trueos_wait_for_terminal_reentry() -> bool {
-    let size = vshell::konsole_size().unwrap_or(vshell::KonsoleSize {
-        cols: 80,
-        rows: 24,
-    });
-    let mut shell2 = vshell::Shell2Frontend::attach(size.cols, size.rows).ok();
-    loop {
-        if let Some(byte) = vshell::attached_read_byte() {
-            if byte == TERMINAL_EXIT_BYTE {
-                return true;
-            }
-            if byte == TERMINAL_REENTRY_BYTE {
-                return false;
-            }
-            if let Some(frontend) = shell2.as_mut() {
-                let _ = frontend.submit_input(&[byte]);
-            }
-        }
-        platform::poll_once();
-        vsys::sleep_ms(5);
-    }
-}
-
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-fn update_trueos_resize(app: &mut App, last_cols: &mut u32, last_rows: &mut u32) {
-    if let Some(size) = vshell::konsole_size() {
-        if size.cols != *last_cols || size.rows != *last_rows {
-            *last_cols = size.cols;
-            *last_rows = size.rows;
-            app.schedule_resize();
-        }
-    }
-}
-
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-fn trueos_byte_to_key(byte: u8) -> Option<InputKey> {
-    if byte == 0x1b {
-        Some(InputKey::Esc)
-    } else if byte == b'\r' || byte == b'\n' {
-        Some(InputKey::Enter)
-    } else if byte == b'\t' {
-        Some(InputKey::Tab)
-    } else if byte == 0x08 || byte == 0x7f {
-        Some(InputKey::Backspace)
-    } else if byte == b' ' || byte.is_ascii_graphic() {
-        Some(InputKey::Char(byte as char))
-    } else {
-        None
-    }
-}
-
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
     let Some(layout) = Layout::current(app.diagnostics)? else {
         return Ok(());
@@ -783,6 +515,45 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
             }
         }
         return Ok(());
+    }
+
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && close_button_hit(layout.menu_x, MENU_WIDTH, mouse.column, mouse.row)
+    {
+        app.should_exit = true;
+        return Ok(());
+    }
+
+    if matches!(mouse.kind, MouseEventKind::Moved) {
+        let hover = if mouse.row == 0 {
+            breadcrumb_target_at(app, layout, mouse.column)
+        } else {
+            None
+        };
+        app.set_path_hover(hover);
+    }
+
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && map_toggle_hit(mouse.column, mouse.row)
+    {
+        app.minimap_visible = !app.minimap_visible;
+        app.mark_dirty();
+        return Ok(());
+    }
+
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && mouse.row == 0 {
+        if let Some(target) = breadcrumb_target_at(app, layout, mouse.column) {
+            match app.graph.mount_path(&target) {
+                Ok(()) => {
+                    app.set_selected(None);
+                    app.set_path_hover(None);
+                    app.clear_transient();
+                    app.log(format!("MOUNT · {}", app.graph.root_label()));
+                }
+                Err(err) => app.log(format!("MOUNT FAILED · {err}")),
+            }
+            return Ok(());
+        }
     }
 
     if let Some(pan) = app.pan {
@@ -818,14 +589,22 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 invoke_menu(app, index)?;
             }
-        } else if let Some(section) = MenuState::section_for_header_row(mouse.row) {
+        } else if let Some(section) = MenuState::section_for_header_row(
+            mouse.row,
+            layout.separator_y,
+            context,
+            app.links.len(),
+        ) {
             if app.menu.set_section(section, context) {
                 app.mark_dirty();
             }
-        } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            if let Some(link_index) =
-                link_index_for_row(mouse.row, layout.separator_y, context, app.links.len())
-            {
+        } else if let Some(link_index) =
+            link_index_for_row(mouse.row, layout.separator_y, context, app.links.len())
+        {
+            if app.menu.set_clip_cursor(link_index, app.links.len()) {
+                app.mark_dirty();
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 open_link(app, link_index)?;
             }
         }
@@ -849,12 +628,16 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         MouseEventKind::Down(MouseButton::Left)
             if layout.viewport.contains(mouse.column, mouse.row) =>
         {
+            if minimap_hit(app, layout, mouse.column, mouse.row) {
+                app.press = None;
+                return Ok(());
+            }
             if let Some(node) = app
                 .graph
                 .hit_test(layout.viewport, mouse.column, mouse.row)
             {
                 if app.selected != Some(node) {
-                    app.selected = Some(node);
+                    app.set_selected(Some(node));
                     app.mark_dirty();
                 }
                 app.press = Some(Press {
@@ -864,7 +647,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                 });
             } else {
                 if app.selected.is_some() {
-                    app.selected = None;
+                    app.set_selected(None);
                     app.mark_dirty();
                 }
                 app.press = None;
@@ -882,7 +665,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                     let over_trash = !over_menu
                         && is_trash_column(mouse.column)
                         && mouse.row <= layout.separator_y;
-                    let target = if over_trash || over_menu {
+                    let over_minimap = !over_menu
+                        && !over_trash
+                        && minimap_hit(app, layout, mouse.column, mouse.row);
+                    let target = if over_trash || over_menu || over_minimap {
                         None
                     } else {
                         app.graph.folder_drop_target(
@@ -942,6 +728,24 @@ fn is_trash_column(x: u16) -> bool {
     x < DROP_HIT_WIDTH
 }
 
+fn minimap_hit(app: &App, layout: Layout, x: u16, y: u16) -> bool {
+    if !app.minimap_visible {
+        return false;
+    }
+    let Ok((width, height)) = terminal::size() else {
+        return false;
+    };
+    Minimap::geometry(
+        width,
+        height,
+        layout.viewport,
+        MIN_WIDTH,
+        Layout::minimum_height(app.diagnostics),
+    )
+    .map(|geometry| geometry.contains(x, y))
+    .unwrap_or(false)
+}
+
 fn add_link(app: &mut App, node_id: usize) {
     let Some(node) = app.graph.node(node_id) else {
         return;
@@ -956,6 +760,11 @@ fn add_link(app: &mut App, node_id: usize) {
     let status = format!("LINK · {}", link.path.display());
     app.links.retain(|existing| existing.path != link.path);
     app.links.push(link);
+    if app.links.len() > 10 {
+        app.links.remove(0);
+    }
+    let newest = app.links.len().saturating_sub(1);
+    app.menu.set_clip_cursor(newest, app.links.len());
     app.log(status);
 }
 
@@ -967,7 +776,7 @@ fn open_link(app: &mut App, index: usize) -> io::Result<()> {
     let result: io::Result<String> = if link.is_dir {
         match app.graph.mount_path(&link.path) {
             Ok(()) => {
-                app.selected = None;
+                app.set_selected(None);
                 Ok(format!("LINK · enter {}", link.path.display()))
             }
             Err(err) => Err(err),
@@ -975,7 +784,8 @@ fn open_link(app: &mut App, index: usize) -> io::Result<()> {
     } else if let Some(parent) = link.path.parent() {
         match app.graph.mount_path(parent) {
             Ok(()) => {
-                app.selected = app.graph.find_node_by_path(&link.path);
+                let selected = app.graph.find_node_by_path(&link.path);
+                app.set_selected(selected);
                 Ok(format!("LINK · {}", link.path.display()))
             }
             Err(err) => Err(err),
@@ -1024,7 +834,7 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
                     | actions::MenuCommand::Enter
                     | actions::MenuCommand::Depth
             ) {
-                app.selected = None;
+                app.set_selected(None);
                 app.clear_transient();
             }
             app.log(status);
@@ -1081,7 +891,7 @@ fn confirm_modal(app: &mut App, yes: bool) -> io::Result<()> {
 
     match execute_modal(modal, &mut app.graph) {
         Ok(outcome) => {
-            app.selected = None;
+            app.set_selected(None);
             app.clear_transient();
             app.log(outcome.status);
             if outcome.trashed_label.is_some() {
@@ -1137,22 +947,8 @@ fn update_animation(app: &mut App, now: Instant) {
     }
 }
 
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
-fn terminal_dimensions() -> io::Result<(u16, u16)> {
-    terminal::size()
-}
-
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-fn terminal_dimensions() -> io::Result<(u16, u16)> {
-    let size = vshell::konsole_size().unwrap_or(vshell::KonsoleSize {
-        cols: 80,
-        rows: 24,
-    });
-    Ok((size.cols as u16, size.rows as u16))
-}
-
-fn compose_frame(app: &App) -> io::Result<Frame> {
-    let (width, height) = terminal_dimensions()?;
+fn compose_frame(app: &mut App) -> io::Result<Frame> {
+    let (width, height) = terminal::size()?;
     let mut frame = Frame::new(width, height);
 
     let Some(layout) = Layout::current(app.diagnostics)? else {
@@ -1184,6 +980,16 @@ fn compose_frame(app: &App) -> io::Result<Frame> {
         drop_target,
     );
 
+    if app.minimap_visible {
+        app.minimap.draw(
+            &mut frame,
+            &app.graph,
+            layout.viewport,
+            MIN_WIDTH,
+            Layout::minimum_height(app.diagnostics),
+        );
+    }
+
     if let Some(drag) = app.drag {
         draw_drag_box(&mut frame, app, drag, layout);
     }
@@ -1199,7 +1005,11 @@ fn compose_frame(app: &App) -> io::Result<Frame> {
         MENU_WIDTH,
         app.menu_context(),
         &app.links,
+        app.selected_stats.as_ref(),
         app.graph.depth_limit(),
+        app.graph.spacing_level(),
+        app.graph.line_style(),
+        app.graph.layout_mode(),
     );
     draw_bottom_rule(
         &mut frame,
@@ -1224,14 +1034,196 @@ fn compose_frame(app: &App) -> io::Result<Frame> {
     Ok(frame)
 }
 
-fn draw_top_rule(frame: &mut Frame, app: &App, menu_x: u16) {
-    let map_cluster = " 🗺 ";
-    let map_width = map_cluster.chars().count() as u16;
-    let map_x = menu_x.saturating_sub(map_width);
-    let title = app.graph.root_label();
+#[derive(Clone, Debug)]
+struct BreadcrumbCrumb {
+    label: String,
+    path: PathBuf,
+    x: u16,
+    width: u16,
+    is_last: bool,
+}
 
-    draw_rule_title(frame, 0, 0, map_x, &title, "🞃", "🞁");
-    print_at(frame, map_x, 0, map_cluster, Style::default());
+#[derive(Clone, Debug)]
+struct BreadcrumbLayout {
+    block_x: u16,
+    content_x: u16,
+    content_width: u16,
+    prefix: Option<String>,
+    crumbs: Vec<BreadcrumbCrumb>,
+}
+
+fn map_toggle_hit(x: u16, y: u16) -> bool {
+    y == 0 && x < terminal_cell_width('🗺') as u16
+}
+
+fn draw_top_rule(frame: &mut Frame, app: &App, menu_x: u16) {
+    // World-map owns the physical top-left. Two cells of air to its right keep
+    // the breadcrumb detached without consuming a leading drop-rail column.
+    let map_cluster = "🗺  ";
+    let map_width = text_cell_width(map_cluster) as u16;
+
+    print_at(frame, 0, 0, map_cluster, Style::default());
+    draw_pattern(frame, map_width, 0, menu_x, "🞃", "🞁");
+    if let Some(layout) = breadcrumb_layout(app.graph.root_path(), map_width, menu_x) {
+        draw_breadcrumb(frame, app, &layout);
+    }
+}
+
+fn breadcrumb_target_at(app: &App, layout: Layout, x: u16) -> Option<PathBuf> {
+    let map_width = text_cell_width("🗺  ") as u16;
+    let crumbs = breadcrumb_layout(app.graph.root_path(), map_width, layout.menu_x)?;
+    crumbs
+        .crumbs
+        .into_iter()
+        .find(|crumb| !crumb.is_last && x >= crumb.x && x < crumb.x.saturating_add(crumb.width))
+        .map(|crumb| crumb.path)
+}
+
+fn breadcrumb_layout(path: &Path, start_x: u16, end_x: u16) -> Option<BreadcrumbLayout> {
+    let width = end_x.saturating_sub(start_x) as usize;
+    if width < 8 {
+        return None;
+    }
+    let max_content = width.saturating_sub(6);
+    if max_content == 0 {
+        return None;
+    }
+
+    let raw = path_components(path);
+    if raw.is_empty() {
+        return None;
+    }
+    let separator = MAIN_SEPARATOR.to_string();
+
+    let content_width_for = |from: usize| -> usize {
+        let mut used = if from > 0 { 2 } else { 0 }; // …/
+        for i in from..raw.len() {
+            if i > from && raw[i - 1].0 != separator {
+                used += 1;
+            }
+            used += text_cell_width(&raw[i].0);
+        }
+        used
+    };
+
+    let mut from = 0usize;
+    while from + 1 < raw.len() && content_width_for(from) > max_content {
+        from += 1;
+    }
+
+    let prefix = (from > 0).then(|| format!("…{MAIN_SEPARATOR}"));
+    let mut labels: Vec<String> = raw[from..].iter().map(|(label, _)| label.clone()).collect();
+    let mut content_width = content_width_for(from);
+    if content_width > max_content {
+        // A single very long final directory name: preserve its tail and keep
+        // the final crumb bold/non-clickable.
+        let prefix_width = prefix.as_deref().map(text_cell_width).unwrap_or(0);
+        let budget = max_content.saturating_sub(prefix_width);
+        if let Some(last) = labels.last_mut() {
+            *last = clip_text_tail_cells(last, budget);
+        }
+        content_width = prefix_width + labels.last().map(|s| text_cell_width(s)).unwrap_or(0);
+    }
+
+    let block_width = content_width.saturating_add(6).min(width);
+    let block_x = start_x + ((width - block_width) / 2) as u16;
+    let content_x = block_x.saturating_add(3);
+    let mut cursor = content_x;
+    if let Some(prefix) = &prefix {
+        cursor = cursor.saturating_add(text_cell_width(prefix) as u16);
+    }
+
+    let mut crumbs = Vec::new();
+    for (local, source_index) in (from..raw.len()).enumerate() {
+        if local > 0 && raw[source_index - 1].0 != separator {
+            cursor = cursor.saturating_add(1);
+        }
+        let label = labels.get(local).cloned().unwrap_or_default();
+        let label_width = text_cell_width(&label) as u16;
+        crumbs.push(BreadcrumbCrumb {
+            label,
+            path: raw[source_index].1.clone(),
+            x: cursor,
+            width: label_width,
+            is_last: source_index + 1 == raw.len(),
+        });
+        cursor = cursor.saturating_add(label_width);
+    }
+
+    Some(BreadcrumbLayout {
+        block_x,
+        content_x,
+        content_width: content_width as u16,
+        prefix,
+        crumbs,
+    })
+}
+
+fn path_components(path: &Path) -> Vec<(String, PathBuf)> {
+    let mut current = PathBuf::new();
+    let mut out = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                out.push((prefix.as_os_str().to_string_lossy().into_owned(), current.clone()));
+            }
+            Component::RootDir => {
+                let root = MAIN_SEPARATOR.to_string();
+                current.push(Path::new(&root));
+                out.push((root, current.clone()));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                current.push("..");
+                out.push(("..".to_string(), current.clone()));
+            }
+            Component::Normal(name) => {
+                current.push(name);
+                out.push((name.to_string_lossy().into_owned(), current.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn draw_breadcrumb(frame: &mut Frame, app: &App, layout: &BreadcrumbLayout) {
+    // Leave the two patterned cells on each side untouched so 🞃🞁/🞁🞃
+    // always continues from absolute column parity rather than from title
+    // string length.
+    print_at(frame, layout.block_x + 2, 0, " ", Style::default());
+    print_at(
+        frame,
+        layout.content_x + layout.content_width,
+        0,
+        " ",
+        Style::default(),
+    );
+
+    let mut cursor = layout.content_x;
+    if let Some(prefix) = &layout.prefix {
+        print_at(frame, cursor, 0, prefix, Style::default());
+        cursor += text_cell_width(prefix) as u16;
+    }
+
+    for (index, crumb) in layout.crumbs.iter().enumerate() {
+        if index > 0 {
+            let previous = &layout.crumbs[index - 1];
+            if previous.label != MAIN_SEPARATOR.to_string() {
+                print_at(frame, cursor, 0, &MAIN_SEPARATOR.to_string(), Style::default());
+                cursor += 1;
+            }
+        }
+
+        let mut style = Style::default();
+        if crumb.is_last {
+            style = style.bold();
+        } else if app.path_hover.as_ref() == Some(&crumb.path) {
+            style = style.underline();
+        }
+        print_at(frame, cursor, 0, &crumb.label, style);
+        cursor += crumb.width;
+    }
 }
 
 fn draw_canvas_frame(frame: &mut Frame, bottom_y: u16) {
@@ -1248,28 +1240,26 @@ fn draw_canvas_frame(frame: &mut Frame, bottom_y: u16) {
 }
 
 fn draw_dropzone(frame: &mut Frame, app: &App, layout: Layout) {
-    let active = app.drag.filter(|drag| drag.over_trash).and_then(|drag| {
+    // The delete target remains a virtual 3-column hit area. Hover does not
+    // repaint boxes/backgrounds: only the dragged file/folder glyph appears.
+    if let Some((y, icon)) = app.drag.filter(|drag| drag.over_trash).and_then(|drag| {
         app.graph.node(drag.node).map(|node| {
             (
                 drag.y.clamp(1, layout.canvas_bottom_y),
                 if node.is_dir { "🖿" } else { "🖹" },
             )
         })
-    });
-
-    if let Some((y, icon)) = active {
-        let active_style = Style::new(Color::White, Color::DarkRed);
-        print_at(frame, DROP_X, y, icon, active_style);
-        print_at(frame, DROP_X, layout.separator_y, "🗑", active_style);
-    } else {
-        print_at(
-            frame,
-            DROP_X,
-            layout.separator_y,
-            "🗑",
-            Style::new(Color::DarkGrey, Color::Reset),
-        );
+    }) {
+        print_at(frame, DROP_X, y, icon, Style::new(Color::Grey, Color::Reset));
     }
+
+    print_at(
+        frame,
+        DROP_X,
+        layout.separator_y,
+        "🗑",
+        Style::new(Color::DarkGrey, Color::Reset),
+    );
 }
 
 fn draw_drag_box(frame: &mut Frame, app: &App, drag: DragState, layout: Layout) {
@@ -1330,15 +1320,15 @@ fn draw_falling(frame: &mut Frame, falling: &FallingGhost, layout: Layout) {
 }
 
 fn draw_bottom_rule(frame: &mut Frame, app: &App, menu_x: u16, y: u16) {
-    let selected_path = app
+    let selected_name = app
         .selected
         .and_then(|id| app.graph.node(id))
         .filter(|node| !node.is_placeholder)
-        .map(|node| node.path.display().to_string())
-        .filter(|path| !path.is_empty());
+        .map(|node| node.name.clone())
+        .filter(|name| !name.is_empty());
 
-    match selected_path {
-        Some(path) => draw_rule_title(frame, FRAME_X, y, menu_x, &path, "🞁", "🞃"),
+    match selected_name {
+        Some(name) => draw_rule_title(frame, FRAME_X, y, menu_x, &name, "🞁", "🞃"),
         None => draw_pattern(frame, FRAME_X, y, menu_x, "🞁", "🞃"),
     }
 }
@@ -1358,27 +1348,25 @@ fn draw_rule_title(
         return;
     }
 
-    const SIDE: &str = "🞃🞁";
-    let side_width = SIDE.chars().count();
-    let fixed = side_width * 2 + 2;
-    let title_width = width.saturating_sub(fixed).max(1);
-    let visible = clip_text_tail(title, title_width);
-    let label = format!("{SIDE} {visible} {SIDE}");
-    let label_width = label.chars().count();
+    let title_width = width.saturating_sub(6).max(1);
+    let visible = clip_text_tail_cells(title, title_width);
+    let visible_width = text_cell_width(&visible);
+    let block_width = visible_width.saturating_add(6).min(width);
+    let block_x = start_x + ((width - block_width) / 2) as u16;
+    let text_x = block_x.saturating_add(3);
 
-    if label_width >= width {
-        print_at(
-            frame,
-            start_x,
-            y,
-            &clip_text_tail(&label, width),
-            Style::default(),
-        );
-        return;
-    }
-
-    let x = start_x + ((width - label_width) / 2) as u16;
-    print_at(frame, x, y, &label, Style::default());
+    // The two cells on either side remain the original alternating pattern.
+    // Only the inner spaces and text are overpainted, so the sequence cannot
+    // produce doubled 🞁🞁 or 🞃🞃 at title boundaries.
+    print_at(frame, block_x + 2, y, " ", Style::default());
+    print_at(frame, text_x, y, &visible, Style::default());
+    print_at(
+        frame,
+        text_x.saturating_add(visible_width as u16),
+        y,
+        " ",
+        Style::default(),
+    );
 }
 
 fn draw_logs(frame: &mut Frame, app: &App, start_y: u16, width: u16) {
@@ -1402,11 +1390,9 @@ fn draw_pattern(
     second: &'static str,
 ) {
     for x in start_x..end_x {
-        let glyph = if (x - start_x) % 2 == 0 {
-            first
-        } else {
-            second
-        };
+        // Absolute-column parity keeps every independently drawn segment on
+        // the same 🞁/🞃 phase, including around overpainted titles.
+        let glyph = if x % 2 == 0 { first } else { second };
         print_at(frame, x, y, glyph, Style::default());
     }
 }
@@ -1425,6 +1411,32 @@ fn clip_text(text: &str, max: usize) -> String {
     let mut clipped: String = text.chars().take(max - 3).collect();
     clipped.push_str("...");
     clipped
+}
+
+fn clip_text_tail_cells(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if text_cell_width(text) <= max {
+        return text.to_string();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+
+    let budget = max - 1;
+    let mut tail = Vec::new();
+    let mut used = 0usize;
+    for ch in text.chars().rev() {
+        let width = terminal_cell_width(ch) as usize;
+        if used + width > budget {
+            break;
+        }
+        tail.push(ch);
+        used += width;
+    }
+    tail.reverse();
+    format!("…{}", tail.into_iter().collect::<String>())
 }
 
 fn clip_text_tail(text: &str, max: usize) -> String {

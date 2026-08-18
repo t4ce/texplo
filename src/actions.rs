@@ -1,8 +1,7 @@
 use std::{
     io,
+    path::PathBuf,
 };
-
-use crate::path::PathBuf;
 
 use crossterm::style::Color;
 
@@ -18,14 +17,17 @@ pub enum MenuCommand {
     Parent,
     TreeLayout,
     RadialLayout,
+    ToggleLayout,
     Spacing,
     Depth,
+    LineStyle,
     Center,
     Enter,
     Sha256,
     Zip,
     Rename,
     NewFolder,
+    NewFile,
     Delete,
     Exit,
 }
@@ -42,10 +44,11 @@ pub enum MenuSection {
     Mount,
     View,
     Action,
+    Clip,
 }
 
 impl MenuSection {
-    const ORDER: [Self; 3] = [Self::Mount, Self::View, Self::Action];
+    const ORDER: [Self; 4] = [Self::Mount, Self::View, Self::Action, Self::Clip];
 
     fn stepped(self, reverse: bool) -> Self {
         let current = Self::ORDER.iter().position(|section| *section == self).unwrap_or(0);
@@ -65,21 +68,22 @@ pub struct MenuEntry {
     pub section: MenuSection,
 }
 
-pub const MENU_ENTRIES: [MenuEntry; 14] = [
-    MenuEntry { label: "reload", command: MenuCommand::Reload, section: MenuSection::Mount },
-    MenuEntry { label: "parent", command: MenuCommand::Parent, section: MenuSection::Mount },
-    MenuEntry { label: "tree layout", command: MenuCommand::TreeLayout, section: MenuSection::View },
-    MenuEntry { label: "radial layout", command: MenuCommand::RadialLayout, section: MenuSection::View },
-    MenuEntry { label: "spacing", command: MenuCommand::Spacing, section: MenuSection::View },
+// The visual order is the contract from ☰enu_Rework.txt. Local hotkeys are
+// assigned after contextual filtering, so every section reuses 🯰..🯹/0..9.
+pub const MENU_ENTRIES: [MenuEntry; 13] = [
+    MenuEntry { label: "first", command: MenuCommand::Reload, section: MenuSection::Mount },
+    MenuEntry { label: "center", command: MenuCommand::Center, section: MenuSection::View },
     MenuEntry { label: "depth", command: MenuCommand::Depth, section: MenuSection::View },
-    MenuEntry { label: "center (home)", command: MenuCommand::Center, section: MenuSection::View },
+    MenuEntry { label: "space", command: MenuCommand::Spacing, section: MenuSection::View },
+    MenuEntry { label: "line", command: MenuCommand::LineStyle, section: MenuSection::View },
+    MenuEntry { label: "layout", command: MenuCommand::ToggleLayout, section: MenuSection::View },
     MenuEntry { label: "enter", command: MenuCommand::Enter, section: MenuSection::Action },
-    MenuEntry { label: "sha256", command: MenuCommand::Sha256, section: MenuSection::Action },
-    MenuEntry { label: "zip", command: MenuCommand::Zip, section: MenuSection::Action },
-    MenuEntry { label: "name", command: MenuCommand::Rename, section: MenuSection::Action },
     MenuEntry { label: "new 🖿", command: MenuCommand::NewFolder, section: MenuSection::Action },
-    MenuEntry { label: "🗑", command: MenuCommand::Delete, section: MenuSection::Action },
-    MenuEntry { label: "exit (esc)", command: MenuCommand::Exit, section: MenuSection::Action },
+    MenuEntry { label: "new 🖹", command: MenuCommand::NewFile, section: MenuSection::Action },
+    MenuEntry { label: "del ␡", command: MenuCommand::Delete, section: MenuSection::Action },
+    MenuEntry { label: "sha ＃", command: MenuCommand::Sha256, section: MenuSection::Action },
+    MenuEntry { label: ".z7 🗜", command: MenuCommand::Zip, section: MenuSection::Action },
+    MenuEntry { label: "esc ␛", command: MenuCommand::Exit, section: MenuSection::Action },
 ];
 
 #[derive(Clone, Debug)]
@@ -90,29 +94,28 @@ pub struct MenuLink {
 
 impl MenuLink {
     pub fn label(&self) -> String {
-        let icon = if self.is_dir { "🖿" } else { "🖹" };
-        let name = self
-            .path
+        self.path
             .file_name()
             .and_then(|s| s.to_str())
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
-            .unwrap_or_else(|| self.path.display().to_string());
-        format!("{icon} {name}")
+            .unwrap_or_else(|| self.path.display().to_string())
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct MenuState {
     pub cursor: usize,
+    pub clip_cursor: usize,
     pub section: MenuSection,
 }
 
 impl Default for MenuState {
     fn default() -> Self {
         Self {
-            cursor: MenuState::index_for_command(MenuCommand::NewFolder).unwrap_or(0),
-            section: MenuSection::Action,
+            cursor: MenuState::index_for_command(MenuCommand::Center).unwrap_or(0),
+            clip_cursor: 0,
+            section: MenuSection::View,
         }
     }
 }
@@ -129,7 +132,20 @@ impl MenuState {
         changed
     }
 
+    pub fn set_clip_cursor(&mut self, index: usize, link_count: usize) -> bool {
+        if link_count == 0 || index >= link_count.min(10) {
+            return false;
+        }
+        let changed = self.section != MenuSection::Clip || self.clip_cursor != index;
+        self.section = MenuSection::Clip;
+        self.clip_cursor = index;
+        changed
+    }
+
     pub fn ensure_visible(&mut self, context: MenuContext) -> bool {
+        if self.section == MenuSection::Clip {
+            return false;
+        }
         if Self::is_visible(self.cursor, context) && MENU_ENTRIES[self.cursor].section == self.section {
             return false;
         }
@@ -137,8 +153,11 @@ impl MenuState {
         let next = Self::first_visible_in_section(self.section, context)
             .or_else(|| {
                 let mut section = self.section;
-                for _ in 0..2 {
+                for _ in 0..3 {
                     section = section.stepped(false);
+                    if section == MenuSection::Clip {
+                        continue;
+                    }
                     if let Some(index) = Self::first_visible_in_section(section, context) {
                         return Some(index);
                     }
@@ -153,20 +172,12 @@ impl MenuState {
     }
 
     pub fn cycle_section(&mut self, reverse: bool, context: MenuContext) -> bool {
-        let mut section = self.section;
-        for _ in 0..3 {
-            section = section.stepped(reverse);
-            if let Some(index) = Self::first_visible_in_section(section, context) {
-                let changed = self.section != section || self.cursor != index;
-                self.section = section;
-                self.cursor = index;
-                return changed;
-            }
+        let section = self.section.stepped(reverse);
+        if section == MenuSection::Clip {
+            let changed = self.section != MenuSection::Clip;
+            self.section = MenuSection::Clip;
+            return changed;
         }
-        false
-    }
-
-    pub fn set_section(&mut self, section: MenuSection, context: MenuContext) -> bool {
         let Some(index) = Self::first_visible_in_section(section, context) else {
             return false;
         };
@@ -176,16 +187,44 @@ impl MenuState {
         changed
     }
 
-    pub fn section_for_header_row(row: u16) -> Option<MenuSection> {
-        match row {
-            1 => Some(MenuSection::Mount),
-            5 => Some(MenuSection::View),
-            12 => Some(MenuSection::Action),
-            _ => None,
+    pub fn set_section(&mut self, section: MenuSection, context: MenuContext) -> bool {
+        if section == MenuSection::Clip {
+            let changed = self.section != section;
+            self.section = section;
+            return changed;
+        }
+        let Some(index) = Self::first_visible_in_section(section, context) else {
+            return false;
+        };
+        let changed = self.section != section || self.cursor != index;
+        self.section = section;
+        self.cursor = index;
+        changed
+    }
+
+    pub fn section_for_header_row(
+        row: u16,
+        bottom: u16,
+        context: MenuContext,
+        link_count: usize,
+    ) -> Option<MenuSection> {
+        if row == 2 {
+            Some(MenuSection::Mount)
+        } else if row == 5 {
+            Some(MenuSection::View)
+        } else if row == 12 {
+            Some(MenuSection::Action)
+        } else if Self::clip_header_row(bottom, context, link_count) == Some(row) {
+            Some(MenuSection::Clip)
+        } else {
+            None
         }
     }
 
     pub fn index_for_hotkey(&self, key: char, context: MenuContext) -> Option<usize> {
+        if self.section == MenuSection::Clip {
+            return None;
+        }
         let local = key.to_digit(10)? as usize;
         MENU_ENTRIES
             .iter()
@@ -195,6 +234,19 @@ impl MenuState {
             })
             .nth(local)
             .map(|(index, _)| index)
+    }
+
+    pub fn clip_index_for_hotkey(
+        &self,
+        key: char,
+        link_count: usize,
+        visible_count: usize,
+    ) -> Option<usize> {
+        if self.section != MenuSection::Clip {
+            return None;
+        }
+        let index = key.to_digit(10)? as usize;
+        (index < link_count.min(10).min(visible_count)).then_some(index)
     }
 
     pub fn index_for_command(command: MenuCommand) -> Option<usize> {
@@ -207,19 +259,22 @@ impl MenuState {
         };
         match entry.command {
             MenuCommand::Reload
-            | MenuCommand::Parent
-            | MenuCommand::TreeLayout
-            | MenuCommand::RadialLayout
+            | MenuCommand::Center
             | MenuCommand::Spacing
             | MenuCommand::Depth
-            | MenuCommand::Center
+            | MenuCommand::LineStyle
+            | MenuCommand::ToggleLayout
             | MenuCommand::Exit => true,
+            MenuCommand::Sha256 | MenuCommand::Zip => context == MenuContext::File,
             MenuCommand::Enter => context == MenuContext::Folder,
-            MenuCommand::Sha256 | MenuCommand::Zip | MenuCommand::Rename => {
-                context == MenuContext::File
+            MenuCommand::NewFolder | MenuCommand::NewFile => {
+                matches!(context, MenuContext::None | MenuContext::Folder)
             }
-            MenuCommand::NewFolder => matches!(context, MenuContext::None | MenuContext::Folder),
             MenuCommand::Delete => matches!(context, MenuContext::File | MenuContext::Folder),
+            MenuCommand::Parent
+            | MenuCommand::TreeLayout
+            | MenuCommand::RadialLayout
+            | MenuCommand::Rename => false,
         }
     }
 
@@ -229,9 +284,10 @@ impl MenuState {
             return None;
         }
         let start = match entry.section {
-            MenuSection::Mount => 2,
+            MenuSection::Mount => 3,
             MenuSection::View => 6,
             MenuSection::Action => 13,
+            MenuSection::Clip => return None,
         };
         let offset = MENU_ENTRIES[..index]
             .iter()
@@ -271,18 +327,52 @@ impl MenuState {
             .map(|(index, _)| index)
     }
 
-    fn action_last_row(context: MenuContext) -> u16 {
-        (0..MENU_ENTRIES.len())
-            .filter_map(|index| {
-                let entry = MENU_ENTRIES[index];
-                if entry.section == MenuSection::Action {
-                    Self::row_for_index(index, context)
-                } else {
-                    None
-                }
-            })
-            .max()
-            .unwrap_or(12)
+    pub fn action_count(context: MenuContext) -> usize {
+        MENU_ENTRIES
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| entry.section == MenuSection::Action && Self::is_visible(*index, context))
+            .count()
+    }
+
+    pub fn stats_header_row(context: MenuContext) -> Option<u16> {
+        if context == MenuContext::None {
+            None
+        } else {
+            Some(14 + Self::action_count(context) as u16)
+        }
+    }
+
+    pub fn fixed_content_bottom(context: MenuContext) -> u16 {
+        match Self::stats_header_row(context) {
+            // Stats header + five values + one breathing row.
+            Some(header) => header + 6,
+            // Action list + one breathing row.
+            None => 13 + Self::action_count(context) as u16,
+        }
+    }
+
+    pub fn clip_visible_count(bottom: u16, context: MenuContext, link_count: usize) -> usize {
+        let fixed = Self::fixed_content_bottom(context);
+        let capacity = bottom.saturating_sub(fixed.saturating_add(2)) as usize;
+        if capacity == 0 {
+            return 0;
+        }
+        let desired = if link_count == 0 { 1 } else { link_count.min(10) };
+        desired.min(capacity)
+    }
+
+    pub fn clip_header_row(
+        bottom: u16,
+        context: MenuContext,
+        link_count: usize,
+    ) -> Option<u16> {
+        let visible = Self::clip_visible_count(bottom, context, link_count);
+        if visible == 0 {
+            None
+        } else {
+            Some(bottom.saturating_sub(visible as u16).saturating_sub(1))
+        }
     }
 }
 
@@ -291,6 +381,7 @@ pub enum PendingAction {
     Move { source: usize, target: usize },
     Trash { source: usize },
     NewFolder { parent: usize },
+    NewFile { parent: usize },
     Rename { source: usize },
 }
 
@@ -351,6 +442,24 @@ impl Modal {
             lines: vec![format!("Parent: {parent_name}"), "Folder name:".to_string()],
             mode: ModalMode::Input {
                 value: "New Folder".to_string(),
+                accept_label: "create",
+            },
+            trash_origin_y: None,
+        }
+    }
+
+    pub fn new_file(graph: &GraphView, parent: usize) -> Self {
+        let parent_name = if parent == 0 {
+            graph.root_label()
+        } else {
+            graph.label(parent)
+        };
+        Self {
+            pending: PendingAction::NewFile { parent },
+            title: "New file".to_string(),
+            lines: vec![format!("Parent: {parent_name}"), "File name:".to_string()],
+            mode: ModalMode::Input {
+                value: "New File".to_string(),
                 accept_label: "create",
             },
             trash_origin_y: None,
@@ -445,6 +554,14 @@ pub fn dispatch_menu(
             graph.set_layout_mode(LayoutMode::Radial);
             Ok(Dispatch::Status("VIEW · radial layout".to_string()))
         }
+        MenuCommand::ToggleLayout => {
+            let mode = graph.toggle_layout_mode();
+            let label = match mode {
+                LayoutMode::Tree => "tree",
+                LayoutMode::Radial => "radial",
+            };
+            Ok(Dispatch::Status(format!("VIEW · {label} layout")))
+        }
         MenuCommand::Spacing => {
             let gap = graph.cycle_spacing();
             Ok(Dispatch::Status(format!("VIEW · spacing {gap}")))
@@ -452,6 +569,10 @@ pub fn dispatch_menu(
         MenuCommand::Depth => {
             let depth = graph.cycle_depth()?;
             Ok(Dispatch::Status(format!("VIEW · depth {depth}")))
+        }
+        MenuCommand::LineStyle => {
+            let style = graph.cycle_line_style();
+            Ok(Dispatch::Status(format!("VIEW · line {}", style.label())))
         }
         MenuCommand::Center => {
             graph.center();
@@ -480,6 +601,12 @@ pub fn dispatch_menu(
                 .unwrap_or(0);
             Ok(Dispatch::Modal(Modal::new_folder(graph, parent)))
         }
+        MenuCommand::NewFile => {
+            let parent = selected
+                .filter(|id| graph.node(*id).map(|n| n.is_dir).unwrap_or(false))
+                .unwrap_or(0);
+            Ok(Dispatch::Modal(Modal::new_file(graph, parent)))
+        }
         MenuCommand::Delete => match selected {
             None => Ok(Dispatch::Status("DELETE · select one file/folder first".to_string())),
             Some(source) => Ok(Dispatch::Modal(Modal::trash_node(graph, source))),
@@ -503,6 +630,11 @@ pub fn execute_modal(modal: Modal, graph: &mut GraphView) -> io::Result<ActionOu
         PendingAction::NewFolder { parent } => {
             let name = modal.input_value().unwrap_or("").trim().to_string();
             let status = graph.create_folder(parent, &name)?;
+            Ok(ActionOutcome { status, trashed_label: None })
+        }
+        PendingAction::NewFile { parent } => {
+            let name = modal.input_value().unwrap_or("").trim().to_string();
+            let status = graph.create_file(parent, &name)?;
             Ok(ActionOutcome { status, trashed_label: None })
         }
         PendingAction::Rename { source } => {
@@ -538,138 +670,6 @@ pub fn modal_click(viewport: Viewport, x: u16, y: u16) -> Option<bool> {
     } else {
         None
     }
-}
-
-pub fn draw_menu(
-    frame: &mut Frame,
-    menu_x: u16,
-    bottom: u16,
-    menu: MenuState,
-    menu_width: u16,
-    context: MenuContext,
-    links: &[MenuLink],
-    depth_limit: usize,
-) {
-    let right = menu_x + menu_width - 1;
-
-    print_at(frame, menu_x, 0, "┯", Style::default());
-    for cx in menu_x + 1..right {
-        print_at(frame, cx, 0, "─", Style::default());
-    }
-    print_at(frame, right, 0, "╮", Style::default());
-    print_at(frame, menu_x + 3, 0, "╼ Menu ╾", Style::default());
-
-    for y in 1..bottom {
-        print_at(frame, menu_x, y, "│", Style::default());
-        print_at(frame, right, y, "│", Style::default());
-    }
-    print_at(frame, menu_x, bottom, "╰", Style::default());
-    for cx in menu_x + 1..right {
-        print_at(frame, cx, bottom, "─", Style::default());
-    }
-    print_at(frame, right, bottom, "╯", Style::default());
-
-    menu_text(frame, menu_x + 2, 1, "Mount");
-    menu_text(frame, menu_x + 2, 5, "View");
-    menu_text(frame, menu_x + 2, 12, "Action");
-
-    for index in 0..MENU_ENTRIES.len() {
-        if MenuState::is_visible(index, context) {
-            draw_menu_entry(frame, menu_x, bottom, menu, menu_width, index, context, depth_limit);
-        }
-    }
-    draw_links(frame, menu_x, bottom, menu_width, context, links);
-}
-
-fn draw_menu_entry(
-    frame: &mut Frame,
-    menu_x: u16,
-    bottom: u16,
-    menu: MenuState,
-    menu_width: u16,
-    index: usize,
-    context: MenuContext,
-    depth_limit: usize,
-) {
-    let Some(entry) = MENU_ENTRIES.get(index) else {
-        return;
-    };
-    let Some(y) = MenuState::row_for_index(index, context) else {
-        return;
-    };
-    if y >= bottom {
-        return;
-    }
-
-    let local = MenuState::local_index(index, context).unwrap_or(0).min(9);
-    let cursor = if menu.cursor == index { "☩" } else { " " };
-    let label = if entry.command == MenuCommand::Depth {
-        format!("depth {depth_limit}")
-    } else {
-        entry.label.to_string()
-    };
-    let body = format!("{local} {cursor} {label}");
-    let inner_width = menu_width.saturating_sub(4) as usize;
-    let line = format!("{:<width$}", clip_text(&body, inner_width), width = inner_width);
-    menu_text(frame, menu_x + 2, y, &line);
-}
-
-fn link_geometry(bottom: u16, context: MenuContext, link_count: usize) -> Option<(u16, usize, usize)> {
-    if link_count == 0 {
-        return None;
-    }
-    let action_last = MenuState::action_last_row(context);
-    let minimum_header = action_last.saturating_add(2);
-    if bottom <= minimum_header.saturating_add(1) {
-        return None;
-    }
-    let capacity = (bottom - minimum_header - 1) as usize;
-    let visible = link_count.min(capacity);
-    if visible == 0 {
-        return None;
-    }
-    let first_index = link_count - visible;
-    let first_row = bottom - visible as u16;
-    let header_row = first_row - 1;
-    Some((header_row, first_index, visible))
-}
-
-fn draw_links(
-    frame: &mut Frame,
-    menu_x: u16,
-    bottom: u16,
-    menu_width: u16,
-    context: MenuContext,
-    links: &[MenuLink],
-) {
-    let Some((header_row, first_index, visible)) = link_geometry(bottom, context, links.len()) else {
-        return;
-    };
-    menu_text(frame, menu_x + 2, header_row, "Links");
-    let inner_width = menu_width.saturating_sub(4) as usize;
-    for offset in 0..visible {
-        let link = &links[first_index + offset];
-        let line = format!(
-            "{:<width$}",
-            clip_text(&link.label(), inner_width),
-            width = inner_width
-        );
-        menu_text(frame, menu_x + 2, header_row + 1 + offset as u16, &line);
-    }
-}
-
-pub fn link_index_for_row(
-    row: u16,
-    bottom: u16,
-    context: MenuContext,
-    link_count: usize,
-) -> Option<usize> {
-    let (header_row, first_index, visible) = link_geometry(bottom, context, link_count)?;
-    let first_row = header_row + 1;
-    if row < first_row || row >= first_row + visible as u16 {
-        return None;
-    }
-    Some(first_index + (row - first_row) as usize)
 }
 
 pub fn draw_modal(frame: &mut Frame, modal: &Modal, viewport: Viewport) {

@@ -2,11 +2,11 @@ use std::{
     collections::HashMap,
     fs,
     io,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use crossterm::style::Color;
-
-use crate::path::{Path, PathBuf};
 
 use crate::{
     layout::{self, LayoutMode, LayoutNode, WorldPos},
@@ -14,7 +14,7 @@ use crate::{
 };
 
 const HARD_MAX_DEPTH: usize = 256;
-const DEPTH_LEVELS: [usize; 5] = [0, 2, 4, 6, 8];
+const DEPTH_LEVELS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 const DEFAULT_DEPTH_LIMIT: usize = 4;
 const MAX_CHILDREN_PER_DIR: usize = 256;
 const MAX_VISIBLE_NODES: usize = 256;
@@ -57,6 +57,45 @@ pub struct FsNode {
     depth: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct SelectionStats {
+    pub key: String,
+    pub kind: String,
+    pub size: String,
+    pub modified: String,
+    pub access: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineStyle {
+    /// Preserve the existing connector choice: S-curve in tree layout and
+    /// radial spline in radial layout.
+    Default,
+    Straight,
+    Elbow,
+    SoftArc,
+}
+
+impl LineStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Straight => "straight",
+            Self::Elbow => "elbow",
+            Self::SoftArc => "soft-arc",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Default => Self::Straight,
+            Self::Straight => Self::Elbow,
+            Self::Elbow => Self::SoftArc,
+            Self::SoftArc => Self::Default,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct EdgeCell {
     x: i32,
@@ -73,8 +112,10 @@ pub struct GraphView {
     camera_y: i32,
     column_gap: i32,
     layout_mode: LayoutMode,
+    line_style: LineStyle,
     suppressed_parent_edges: Vec<bool>,
     depth_limit: usize,
+    scene_revision: u64,
 }
 
 impl GraphView {
@@ -89,8 +130,10 @@ impl GraphView {
             camera_y: 0,
             column_gap: 18,
             layout_mode: LayoutMode::Tree,
+            line_style: LineStyle::Default,
             suppressed_parent_edges: Vec::new(),
             depth_limit: DEFAULT_DEPTH_LIMIT,
+            scene_revision: 0,
         };
         view.reload()?;
         Ok(view)
@@ -319,6 +362,7 @@ impl GraphView {
             LayoutMode::Radial => vec![false; layout_nodes.len()],
         };
         self.rebuild_edge_cache();
+        self.bump_scene_revision();
     }
 
     fn rebuild_edge_cache(&mut self) {
@@ -364,9 +408,14 @@ impl GraphView {
                 self.node_width(parent_id),
             );
 
-            match self.layout_mode {
-                LayoutMode::Tree => braille.draw_s_curve(a, b),
-                LayoutMode::Radial => braille.draw_radial_spline(a, b),
+            match self.line_style {
+                LineStyle::Default => match self.layout_mode {
+                    LayoutMode::Tree => braille.draw_s_curve(a, b),
+                    LayoutMode::Radial => braille.draw_radial_spline(a, b),
+                },
+                LineStyle::Straight => braille.draw_straight(a, b),
+                LineStyle::Elbow => braille.draw_elbow(a, b),
+                LineStyle::SoftArc => braille.draw_soft_arc(a, b),
             }
         }
         self.edge_cells = braille.into_cells();
@@ -407,6 +456,18 @@ impl GraphView {
     }
 
 
+    pub fn line_style(&self) -> LineStyle {
+        self.line_style
+    }
+
+    pub fn cycle_line_style(&mut self) -> LineStyle {
+        self.line_style = self.line_style.next();
+        // Connector style is intentionally independent from filesystem scanning
+        // and node placement. Only the sparse Braille edge cache changes.
+        self.rebuild_edge_cache();
+        self.line_style
+    }
+
     pub fn depth_limit(&self) -> usize {
         self.depth_limit
     }
@@ -430,8 +491,134 @@ impl GraphView {
         self.column_gap
     }
 
+    pub fn spacing_level(&self) -> usize {
+        match self.column_gap {
+            14 => 0,
+            18 => 1,
+            22 => 2,
+            26 => 3,
+            30 => 4,
+            value if value < 18 => 0,
+            value if value < 22 => 1,
+            value if value < 26 => 2,
+            value if value < 30 => 3,
+            _ => 4,
+        }
+    }
+
+    pub fn toggle_layout_mode(&mut self) -> LayoutMode {
+        let next = match self.layout_mode {
+            LayoutMode::Tree => LayoutMode::Radial,
+            LayoutMode::Radial => LayoutMode::Tree,
+        };
+        self.set_layout_mode(next);
+        self.layout_mode
+    }
+
     pub fn root_label(&self) -> String {
         self.root.display().to_string()
+    }
+
+    pub fn root_path(&self) -> &Path {
+        &self.root
+    }
+
+    /// Revision for world-space geometry/content used by passive overlays such
+    /// as the minimap. Camera movement deliberately does not change it.
+    pub fn scene_revision(&self) -> u64 {
+        self.scene_revision
+    }
+
+    /// Sparse world-space samples for the minimap. This intentionally ignores
+    /// the current camera and line-style raster. Nodes plus a few parent-edge
+    /// samples are enough to preserve the graph's overall silhouette/density.
+    pub fn minimap_samples(&self) -> Vec<(i32, i32)> {
+        let mut samples = Vec::with_capacity(self.nodes.len().saturating_mul(4));
+
+        for node in &self.nodes {
+            if node.id == 0 || node.hidden || node.is_removed {
+                continue;
+            }
+            let Some(pos) = self.positions.get(node.id).copied() else {
+                continue;
+            };
+            let center = (pos.x + self.node_width(node.id) as i32 / 2, pos.y);
+            samples.push(center);
+
+            let Some(parent_id) = node.parent else {
+                continue;
+            };
+            if parent_id == 0 {
+                continue;
+            }
+            if self.layout_mode == LayoutMode::Tree
+                && self
+                    .suppressed_parent_edges
+                    .get(node.id)
+                    .copied()
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(parent) = self.node(parent_id) else {
+                continue;
+            };
+            if parent.hidden || parent.is_removed {
+                continue;
+            }
+            let Some(parent_pos) = self.positions.get(parent_id).copied() else {
+                continue;
+            };
+            let parent_center = (
+                parent_pos.x + self.node_width(parent_id) as i32 / 2,
+                parent_pos.y,
+            );
+
+            // Three cheap interpolation samples suggest hierarchy without
+            // copying the expensive/high-resolution Braille connector raster.
+            for step in 1..=3 {
+                let x = parent_center.0 + (center.0 - parent_center.0) * step / 4;
+                let y = parent_center.1 + (center.1 - parent_center.1) * step / 4;
+                samples.push((x, y));
+            }
+        }
+
+        samples
+    }
+
+    fn bump_scene_revision(&mut self) {
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+    }
+
+    pub fn selection_stats(&self, id: usize) -> Option<SelectionStats> {
+        let node = self.node(id)?;
+        if node.id == 0 || node.is_placeholder || node.is_removed || node.hidden {
+            return None;
+        }
+
+        let metadata = fs::metadata(&node.path).ok();
+        let size = metadata
+            .as_ref()
+            .map(|meta| human_bytes(meta.len()))
+            .unwrap_or_else(|| "?".to_string());
+        let modified = metadata
+            .as_ref()
+            .and_then(|meta| meta.modified().ok())
+            .map(relative_age)
+            .unwrap_or_else(|| "?".to_string());
+        let access = metadata
+            .as_ref()
+            .map(|meta| if meta.permissions().readonly() { "read only" } else { "read/write" })
+            .unwrap_or("?")
+            .to_string();
+
+        Some(SelectionStats {
+            key: format!("#{}", node.id),
+            kind: if node.is_dir { "folder" } else { "file" }.to_string(),
+            size,
+            modified,
+            access,
+        })
     }
 
     pub fn node(&self, id: usize) -> Option<&FsNode> {
@@ -573,6 +760,29 @@ impl GraphView {
         Ok(message)
     }
 
+    pub fn create_file(&mut self, parent: usize, name: &str) -> io::Result<String> {
+        validate_name(name)?;
+        let parent_path = if parent == 0 {
+            self.root.clone()
+        } else {
+            let node = self.node(parent).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "parent folder disappeared")
+            })?;
+            if node.is_placeholder || node.is_removed || node.hidden || !node.is_dir {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "parent is not a folder"));
+            }
+            node.path.clone()
+        };
+        let destination = parent_path.join(name);
+        if destination.exists() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "name already exists"));
+        }
+        fs::OpenOptions::new().write(true).create_new(true).open(&destination)?;
+        let message = format!("NEW · 🖹 {name}");
+        self.reload()?;
+        Ok(message)
+    }
+
     pub fn rename_node(&mut self, source: usize, name: &str) -> io::Result<String> {
         validate_name(name)?;
         if source == 0 {
@@ -682,6 +892,7 @@ impl GraphView {
         // edges inside a removed folder vanish, while its parent→tombstone edge may
         // remain. This is much cheaper than rescanning and laying out the tree.
         self.rebuild_edge_cache();
+        self.bump_scene_revision();
 
         let message = format!("TRASH · {} → .explorer-trash/", src.name);
         Ok(message)
@@ -732,8 +943,12 @@ impl GraphView {
             let label = self.visual_label(node.id);
             let mut style = Style::new(Color::Grey, Color::Reset);
 
-            if node.is_removed || node.is_placeholder {
+            if node.is_removed {
                 style = Style::new(Color::DarkGrey, Color::Reset);
+            } else if node.is_placeholder {
+                // Truncation must be visually loud enough to read as an actual
+                // node in both tree and radial views.
+                style = Style::new(Color::Black, Color::White);
             } else if node.is_dir {
                 style = Style::new(Color::Black, Color::White);
             }
@@ -999,6 +1214,66 @@ impl WorldBrailleCanvas {
         }
     }
 
+    fn sample_quadratic(&mut self, a: Point, c: Point, b: Point) {
+        let distance = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+        let steps = ((distance / 2.1).ceil() as usize).clamp(8, 512);
+        let mut previous = a;
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let mt = 1.0 - t;
+            let point = Point {
+                x: mt * mt * a.x + 2.0 * mt * t * c.x + t * t * b.x,
+                y: mt * mt * a.y + 2.0 * mt * t * c.y + t * t * b.y,
+            };
+            self.draw_segment(previous, point);
+            previous = point;
+        }
+    }
+
+    fn draw_straight(&mut self, a: Point, b: Point) {
+        self.draw_segment(Self::to_dot(a), Self::to_dot(b));
+    }
+
+    fn draw_elbow(&mut self, a: Point, b: Point) {
+        let a = Self::to_dot(a);
+        let b = Self::to_dot(b);
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+
+        if dx.abs() >= dy.abs() {
+            let middle_x = ((a.x + b.x) * 0.5).round();
+            let p1 = Point { x: middle_x, y: a.y };
+            let p2 = Point { x: middle_x, y: b.y };
+            self.draw_segment(a, p1);
+            self.draw_segment(p1, p2);
+            self.draw_segment(p2, b);
+        } else {
+            let middle_y = ((a.y + b.y) * 0.5).round();
+            let p1 = Point { x: a.x, y: middle_y };
+            let p2 = Point { x: b.x, y: middle_y };
+            self.draw_segment(a, p1);
+            self.draw_segment(p1, p2);
+            self.draw_segment(p2, b);
+        }
+    }
+
+    fn draw_soft_arc(&mut self, a: Point, b: Point) {
+        let a = Self::to_dot(a);
+        let b = Self::to_dot(b);
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let distance = (dx * dx + dy * dy).sqrt().max(1.0);
+        let bend = (distance * 0.15).clamp(4.0, 18.0);
+        let nx = -dy / distance;
+        let ny = dx / distance;
+        let sign = if a.x + b.x < 0.0 { -1.0 } else { 1.0 };
+        let control = Point {
+            x: (a.x + b.x) * 0.5 + nx * bend * sign,
+            y: (a.y + b.y) * 0.5 + ny * bend * sign,
+        };
+        self.sample_quadratic(a, control, b);
+    }
+
     fn draw_s_curve(&mut self, a: Point, b: Point) {
         let a = Self::to_dot(a);
         let b = Self::to_dot(b);
@@ -1062,5 +1337,39 @@ impl WorldBrailleCanvas {
             },
             b,
         );
+    }
+}
+
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else if value >= 10.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn relative_age(when: SystemTime) -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(when)
+        .unwrap_or(Duration::ZERO);
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
     }
 }
