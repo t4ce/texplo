@@ -4,6 +4,9 @@ version = "0.14.0"
 edition = "2024"
 
 [dependencies]
+crossterm = { path = "vendor/crossterm-0.29.0", default-features = false }
+
+[target.'cfg(not(any(target_os = "trueos", target_os = "zkvm")))'.dependencies]
 crossterm = { path = "vendor/crossterm-0.29.0", default-features = false, features = ["events"] }
 
 [target.'cfg(any(target_os = "trueos", target_os = "zkvm"))'.dependencies]

@@ -15,6 +15,11 @@ use actions::{
     dispatch_menu, draw_menu, draw_modal, execute_modal, link_index_for_row, modal_click,
     Dispatch, MenuContext, MenuLink, MenuState, Modal, PendingAction, MENU_ENTRIES,
 };
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+use trueos::{platform, vshell, vsys};
+
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
 use crossterm::{
     cursor::{Hide, Show},
     event::{
@@ -22,11 +27,12 @@ use crossterm::{
         MouseEvent, MouseEventKind,
     },
     execute,
-    style::{Color, ResetColor},
+    style::ResetColor,
     terminal::{
         self, DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
+use crossterm::style::Color;
 use graph_view::{GraphView, Viewport};
 use screen::{Frame, Renderer, Style};
 
@@ -43,6 +49,9 @@ const MAX_EVENT_BATCH: usize = 64;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(70);
 const BUILD_ID: &str = "v0.14 · wide-cell tombstones";
 const FALL_TICK: Duration = Duration::from_millis(90);
+const TERMINAL_EXIT_BYTE: u8 = 0x11;
+const TERMINAL_WAIT_BYTE: u8 = 0x12;
+const TERMINAL_REENTRY_BYTE: u8 = 0x1f;
 
 #[derive(Clone, Copy)]
 struct Config {
@@ -80,6 +89,7 @@ impl Config {
 struct TerminalGuard;
 
 impl TerminalGuard {
+    #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
 
@@ -98,7 +108,9 @@ impl TerminalGuard {
     }
 }
 
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
 impl Drop for TerminalGuard {
+    #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
     fn drop(&mut self) {
         let _ = execute!(
             stdout(),
@@ -110,6 +122,46 @@ impl Drop for TerminalGuard {
         );
         let _ = terminal::disable_raw_mode();
     }
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+#[derive(Clone, Copy)]
+enum InputKey {
+    Backspace,
+    Char(char),
+    Delete,
+    Down,
+    Esc,
+    Enter,
+    Home,
+    Left,
+    Right,
+    Tab,
+    Up,
+    BackTab,
+}
+
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+#[derive(Clone, Copy)]
+enum InputKey {
+    Backspace,
+    BackTab,
+    Char(char),
+    Delete,
+    Down,
+    Esc,
+    Enter,
+    Home,
+    Left,
+    Right,
+    Tab,
+    Up,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumeMode {
+    Exit,
+    WaitReentry,
 }
 
 #[derive(Clone, Copy)]
@@ -245,7 +297,7 @@ impl Layout {
     }
 
     fn current(diagnostics: bool) -> io::Result<Option<Self>> {
-        let (width, height) = terminal::size()?;
+        let (width, height) = terminal_dimensions()?;
         if width < MIN_WIDTH || height < Self::minimum_height(diagnostics) {
             return Ok(None);
         }
@@ -271,6 +323,7 @@ impl Layout {
     }
 }
 
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
 fn main() -> io::Result<()> {
     let config = Config::from_args();
     let _terminal = TerminalGuard::enter()?;
@@ -311,17 +364,95 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn main() -> io::Result<()> {
+    let config = Config::from_args();
+    let mut out = stdout();
+    let mut renderer = Renderer::default();
+    let mut app = App::new(config)?;
+
+    loop {
+        let mut mode = ResumeMode::Exit;
+        let mut last_cols = 0u32;
+        let mut last_rows = 0u32;
+        app.mark_dirty();
+
+        trueos_terminal_enter();
+        if let Some(size) = vshell::konsole_size() {
+            last_cols = size.cols;
+            last_rows = size.rows;
+        }
+
+        'session: loop {
+            let now = Instant::now();
+            update_trueos_resize(&mut app, &mut last_cols, &mut last_rows);
+            app.update_resize(now);
+            update_animation(&mut app, now);
+
+            if app.dirty && app.resize_deadline.is_none() {
+                let frame = compose_frame(&app)?;
+                renderer.present(&mut out, frame)?;
+                app.dirty = false;
+            }
+
+            if app.should_exit {
+                mode = ResumeMode::Exit;
+                break 'session;
+            }
+
+            match vshell::attached_read_byte() {
+                Some(TERMINAL_EXIT_BYTE) => {
+                    mode = ResumeMode::Exit;
+                    break 'session;
+                }
+                Some(TERMINAL_WAIT_BYTE) => {
+                    mode = ResumeMode::WaitReentry;
+                    break 'session;
+                }
+                Some(TERMINAL_REENTRY_BYTE) => {
+                    mode = ResumeMode::WaitReentry;
+                    break 'session;
+                }
+                Some(byte) => {
+                    if let Some(key) = trueos_byte_to_key(byte) {
+                        handle_key(&mut app, key)?;
+                    }
+                }
+                None => {}
+            }
+
+            platform::poll_once();
+            vsys::sleep_ms(5);
+        }
+
+        trueos_terminal_exit(mode == ResumeMode::Exit);
+        if mode == ResumeMode::Exit {
+            return Ok(());
+        }
+
+        if trueos_wait_for_terminal_reentry() {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
 fn handle_event(app: &mut App, event: Event) -> io::Result<()> {
     match event {
         Event::Resize(_, _) => app.schedule_resize(),
-        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key.code)?,
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if let Some(key) = key_code_to_input_key(key.code) {
+                handle_key(app, key)?;
+            }
+        }
         Event::Mouse(mouse) => handle_mouse(app, mouse)?,
         _ => {}
     }
     Ok(())
 }
 
-fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+fn handle_key(app: &mut App, code: InputKey) -> io::Result<()> {
     if app.modal.is_some() {
         let is_input = app
             .modal
@@ -330,9 +461,9 @@ fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
             .unwrap_or(false);
         if is_input {
             match code {
-                KeyCode::Enter => confirm_modal(app, true)?,
-                KeyCode::Esc => confirm_modal(app, false)?,
-                KeyCode::Backspace => {
+                InputKey::Enter => confirm_modal(app, true)?,
+                InputKey::Esc => confirm_modal(app, false)?,
+                InputKey::Backspace => {
                     let changed = app
                         .modal
                         .as_mut()
@@ -342,7 +473,7 @@ fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
                         app.mark_dirty();
                     }
                 }
-                KeyCode::Char(ch) => {
+                InputKey::Char(ch) => {
                     let changed = app
                         .modal
                         .as_mut()
@@ -356,10 +487,10 @@ fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
             }
         } else {
             match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                InputKey::Char('y') | InputKey::Char('Y') | InputKey::Enter => {
                     confirm_modal(app, true)?
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                InputKey::Char('n') | InputKey::Char('N') | InputKey::Esc => {
                     confirm_modal(app, false)?
                 }
                 _ => {}
@@ -369,50 +500,54 @@ fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
     }
 
     match code {
-        KeyCode::Esc => app.should_exit = true,
-        KeyCode::Tab => {
+        InputKey::Esc => app.should_exit = true,
+        InputKey::Tab => {
             let context = app.menu_context();
             if app.menu.cycle_section(false, context) {
                 app.mark_dirty();
             }
         }
-        KeyCode::BackTab => {
+        InputKey::BackTab => {
             let context = app.menu_context();
             if app.menu.cycle_section(true, context) {
                 app.mark_dirty();
             }
         }
-        KeyCode::Home => {
+        InputKey::Home => {
             if let Some(index) = MenuState::index_for_command(actions::MenuCommand::Center) {
                 let context = app.menu_context();
                 app.menu.set_cursor(index, context);
                 invoke_menu(app, index)?;
             }
         }
-        KeyCode::Left | KeyCode::Char('a') | KeyCode::Char('A') => {
+        InputKey::Left
+        | InputKey::Char('a')
+        | InputKey::Char('A') => {
             app.graph.pan(2, 0);
             app.mark_dirty();
         }
-        KeyCode::Right | KeyCode::Char('d') | KeyCode::Char('D') => {
+        InputKey::Right
+        | InputKey::Char('d')
+        | InputKey::Char('D') => {
             app.graph.pan(-2, 0);
             app.mark_dirty();
         }
-        KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('W') => {
+        InputKey::Up | InputKey::Char('w') | InputKey::Char('W') => {
             app.graph.pan(0, 2);
             app.mark_dirty();
         }
-        KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('S') => {
+        InputKey::Down | InputKey::Char('s') | InputKey::Char('S') => {
             app.graph.pan(0, -2);
             app.mark_dirty();
         }
-        KeyCode::Enter => {
+        InputKey::Enter => {
             if app.menu_context() == MenuContext::Folder {
                 if let Some(index) = MenuState::index_for_command(actions::MenuCommand::Enter) {
                     invoke_menu(app, index)?;
                 }
             }
         }
-        KeyCode::Delete | KeyCode::Backspace => {
+        InputKey::Delete | InputKey::Backspace => {
             if let Some(source) = app.selected.filter(|id| *id != 0) {
                 let mut modal = Modal::trash_node(&app.graph, source);
                 if let Some(y) = selected_screen_y(app, source) {
@@ -422,7 +557,7 @@ fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
                 app.mark_dirty();
             }
         }
-        KeyCode::Char(ch) if ch.is_ascii_digit() => {
+        InputKey::Char(ch) if ch.is_ascii_digit() => {
             let context = app.menu_context();
             if let Some(index) = app.menu.index_for_hotkey(ch, context) {
                 app.menu.set_cursor(index, context);
@@ -434,6 +569,208 @@ fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn handle_key(app: &mut App, code: InputKey) -> io::Result<()> {
+    if app.modal.is_some() {
+        let is_input = app
+            .modal
+            .as_ref()
+            .map(|modal| modal.is_input())
+            .unwrap_or(false);
+        if is_input {
+            match code {
+                InputKey::Enter => confirm_modal(app, true)?,
+                InputKey::Esc => confirm_modal(app, false)?,
+                InputKey::Backspace => {
+                    let changed = app
+                        .modal
+                        .as_mut()
+                        .map(|modal| modal.backspace())
+                        .unwrap_or(false);
+                    if changed {
+                        app.mark_dirty();
+                    }
+                }
+                InputKey::Char(ch) => {
+                    let changed = app
+                        .modal
+                        .as_mut()
+                        .map(|modal| modal.push_char(ch))
+                        .unwrap_or(false);
+                    if changed {
+                        app.mark_dirty();
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            match code {
+                InputKey::Char('y') | InputKey::Char('Y') | InputKey::Enter => {
+                    confirm_modal(app, true)?
+                }
+                InputKey::Char('n') | InputKey::Char('N') | InputKey::Esc => {
+                    confirm_modal(app, false)?
+                }
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
+
+    match code {
+        InputKey::Esc => app.should_exit = true,
+        InputKey::Char('\t') | InputKey::Tab => {
+            if app.menu.cycle_section(false, app.menu_context()) {
+                app.mark_dirty();
+            }
+        }
+        InputKey::Home => {
+            if let Some(index) = MenuState::index_for_command(actions::MenuCommand::Center) {
+                app.menu.set_cursor(index, app.menu_context());
+                invoke_menu(app, index)?;
+            }
+        }
+        InputKey::Left => {
+            app.graph.pan(2, 0);
+            app.mark_dirty();
+        }
+        InputKey::Right => {
+            app.graph.pan(-2, 0);
+            app.mark_dirty();
+        }
+        InputKey::Up => {
+            app.graph.pan(0, 2);
+            app.mark_dirty();
+        }
+        InputKey::Down => {
+            app.graph.pan(0, -2);
+            app.mark_dirty();
+        }
+        InputKey::Enter => {
+            if app.menu_context() == MenuContext::Folder {
+                if let Some(index) = MenuState::index_for_command(actions::MenuCommand::Enter) {
+                    invoke_menu(app, index)?;
+                }
+            }
+        }
+        InputKey::Delete | InputKey::Backspace => {
+            if let Some(source) = app.selected.filter(|id| *id != 0) {
+                let mut modal = Modal::trash_node(&app.graph, source);
+                if let Some(y) = selected_screen_y(app, source) {
+                    modal = modal.with_origin_y(y);
+                }
+                app.modal = Some(modal);
+                app.mark_dirty();
+            }
+        }
+        InputKey::Char(ch) if ch.is_ascii_digit() => {
+            let context = app.menu_context();
+            if let Some(index) = app.menu.index_for_hotkey(ch, context) {
+                app.menu.set_cursor(index, context);
+                invoke_menu(app, index)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+fn key_code_to_input_key(code: KeyCode) -> Option<InputKey> {
+    match code {
+        KeyCode::BackTab => Some(InputKey::BackTab),
+        KeyCode::Backspace => Some(InputKey::Backspace),
+        KeyCode::Delete => Some(InputKey::Delete),
+        KeyCode::Down => Some(InputKey::Down),
+        KeyCode::Esc => Some(InputKey::Esc),
+        KeyCode::Enter => Some(InputKey::Enter),
+        KeyCode::Home => Some(InputKey::Home),
+        KeyCode::Left => Some(InputKey::Left),
+        KeyCode::Right => Some(InputKey::Right),
+        KeyCode::Tab => Some(InputKey::Tab),
+        KeyCode::Up => Some(InputKey::Up),
+        KeyCode::Char(ch) => Some(InputKey::Char(ch)),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn trueos_terminal_enter() {
+    let size = vshell::konsole_size().unwrap_or(vshell::KonsoleSize {
+        cols: 80,
+        rows: 24,
+    });
+    let _ = vshell::konsole_begin_frame(
+        size.cols,
+        size.rows,
+        vshell::KONSOLE_FRAME_TERMINAL_HANDOFF,
+    );
+    let _ = vshell::attached_write(b"\x1b[?1049h\x1b[?25h");
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn trueos_terminal_exit(full_exit: bool) {
+    let _ = vshell::attached_write(b"\x1b[?1049l\x1b[?25h\x1b[2J\x1b[H");
+    let _ = vshell::konsole_end_frame();
+    vshell::leave_terminal_handoff();
+    if full_exit {
+        let _ = vshell::shutdown_current_blueprint("texplo terminated");
+    }
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn trueos_wait_for_terminal_reentry() -> bool {
+    let size = vshell::konsole_size().unwrap_or(vshell::KonsoleSize {
+        cols: 80,
+        rows: 24,
+    });
+    let mut shell2 = vshell::Shell2Frontend::attach(size.cols, size.rows).ok();
+    loop {
+        if let Some(byte) = vshell::attached_read_byte() {
+            if byte == TERMINAL_EXIT_BYTE {
+                return true;
+            }
+            if byte == TERMINAL_REENTRY_BYTE {
+                return false;
+            }
+            if let Some(frontend) = shell2.as_mut() {
+                let _ = frontend.submit_input(&[byte]);
+            }
+        }
+        platform::poll_once();
+        vsys::sleep_ms(5);
+    }
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn update_trueos_resize(app: &mut App, last_cols: &mut u32, last_rows: &mut u32) {
+    if let Some(size) = vshell::konsole_size() {
+        if size.cols != *last_cols || size.rows != *last_rows {
+            *last_cols = size.cols;
+            *last_rows = size.rows;
+            app.schedule_resize();
+        }
+    }
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn trueos_byte_to_key(byte: u8) -> Option<InputKey> {
+    if byte == 0x1b {
+        Some(InputKey::Esc)
+    } else if byte == b'\r' || byte == b'\n' {
+        Some(InputKey::Enter)
+    } else if byte == b'\t' {
+        Some(InputKey::Tab)
+    } else if byte == 0x08 || byte == 0x7f {
+        Some(InputKey::Backspace)
+    } else if byte == b' ' || byte.is_ascii_graphic() {
+        Some(InputKey::Char(byte as char))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
     let Some(layout) = Layout::current(app.diagnostics)? else {
         return Ok(());
@@ -800,8 +1137,22 @@ fn update_animation(app: &mut App, now: Instant) {
     }
 }
 
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+fn terminal_dimensions() -> io::Result<(u16, u16)> {
+    terminal::size()
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn terminal_dimensions() -> io::Result<(u16, u16)> {
+    let size = vshell::konsole_size().unwrap_or(vshell::KonsoleSize {
+        cols: 80,
+        rows: 24,
+    });
+    Ok((size.cols as u16, size.rows as u16))
+}
+
 fn compose_frame(app: &App) -> io::Result<Frame> {
-    let (width, height) = terminal::size()?;
+    let (width, height) = terminal_dimensions()?;
     let mut frame = Frame::new(width, height);
 
     let Some(layout) = Layout::current(app.diagnostics)? else {
