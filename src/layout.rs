@@ -184,7 +184,10 @@ impl TreeEngine<'_> {
             self.place_dense_children(&child_ids, top_y, x_bias)
         };
 
-        self.positions[id] = WorldPos { x, y: group.root_y };
+        self.positions[id] = WorldPos {
+            x,
+            y: group.root_y,
+        };
 
         Placement {
             root_y: group.root_y,
