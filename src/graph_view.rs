@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -10,7 +9,7 @@ use crossterm::style::Color;
 
 use crate::{
     layout::{self, LayoutMode, LayoutNode, WorldPos},
-    screen::{text_cell_width, terminal_cell_width, Frame, Style},
+    screen::{terminal_cell_width, text_cell_width, Frame, Style},
 };
 
 const HARD_MAX_DEPTH: usize = 256;
@@ -193,9 +192,10 @@ impl GraphView {
     }
 
     pub fn mount_node(&mut self, id: usize) -> io::Result<()> {
-        let node = self.node(id).cloned().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "folder disappeared")
-        })?;
+        let node = self
+            .node(id)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "folder disappeared"))?;
         if node.is_placeholder || node.is_removed || node.hidden || !node.is_dir {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a folder"));
         }
@@ -205,7 +205,10 @@ impl GraphView {
     pub fn mount_path(&mut self, path: &Path) -> io::Result<()> {
         let meta = fs::metadata(path)?;
         if !meta.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "mount target is not a folder"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mount target is not a folder",
+            ));
         }
         self.root = path.to_path_buf();
         self.center();
@@ -215,7 +218,9 @@ impl GraphView {
     pub fn find_node_by_path(&self, path: &Path) -> Option<usize> {
         self.nodes
             .iter()
-            .find(|node| !node.is_placeholder && !node.is_removed && !node.hidden && node.path == path)
+            .find(|node| {
+                !node.is_placeholder && !node.is_removed && !node.hidden && node.path == path
+            })
             .map(|node| node.id)
     }
 
@@ -382,7 +387,12 @@ impl GraphView {
             let Some(parent_id) = node.parent else {
                 continue;
             };
-            if parent_id == 0 || self.node(parent_id).map(|parent| parent.hidden).unwrap_or(true) {
+            if parent_id == 0
+                || self
+                    .node(parent_id)
+                    .map(|parent| parent.hidden)
+                    .unwrap_or(true)
+            {
                 continue;
             }
             if self.layout_mode == LayoutMode::Tree
@@ -559,7 +569,6 @@ impl GraphView {
         )
     }
 
-
     pub fn line_style(&self) -> LineStyle {
         self.line_style
     }
@@ -580,7 +589,12 @@ impl GraphView {
         let current = DEPTH_LEVELS
             .iter()
             .position(|value| *value == self.depth_limit)
-            .unwrap_or_else(|| DEPTH_LEVELS.iter().position(|value| *value == DEFAULT_DEPTH_LIMIT).unwrap_or(0));
+            .unwrap_or_else(|| {
+                DEPTH_LEVELS
+                    .iter()
+                    .position(|value| *value == DEFAULT_DEPTH_LIMIT)
+                    .unwrap_or(0)
+            });
         self.depth_limit = DEPTH_LEVELS[(current + 1) % DEPTH_LEVELS.len()];
         self.reload()?;
         Ok(self.depth_limit)
@@ -712,7 +726,13 @@ impl GraphView {
             .unwrap_or_else(|| "?".to_string());
         let access = metadata
             .as_ref()
-            .map(|meta| if meta.permissions().readonly() { "read only" } else { "read/write" })
+            .map(|meta| {
+                if meta.permissions().readonly() {
+                    "read only"
+                } else {
+                    "read/write"
+                }
+            })
             .unwrap_or("?")
             .to_string();
 
@@ -795,7 +815,13 @@ impl GraphView {
         // by one terminal cell on every side. The tree layout reserves extra Y
         // room between folder siblings so these virtual hit areas stay usable.
         for node in self.nodes.iter().rev() {
-            if node.id == 0 || node.is_placeholder || node.is_removed || node.hidden || !node.is_dir || !self.can_move(source, node.id) {
+            if node.id == 0
+                || node.is_placeholder
+                || node.is_removed
+                || node.hidden
+                || !node.is_dir
+                || !self.can_move(source, node.id)
+            {
                 continue;
             }
             let Some((sx, sy)) = self.screen_pos(node.id, viewport) else {
@@ -821,7 +847,15 @@ impl GraphView {
         let Some(dst) = self.node(target) else {
             return false;
         };
-        if src.is_placeholder || dst.is_placeholder || src.is_removed || dst.is_removed || src.hidden || dst.hidden || !dst.is_dir || src.parent == Some(target) {
+        if src.is_placeholder
+            || dst.is_placeholder
+            || src.is_removed
+            || dst.is_removed
+            || src.hidden
+            || dst.hidden
+            || !dst.is_dir
+            || src.parent == Some(target)
+        {
             return false;
         }
         if src.is_dir && self.is_descendant(target, source) {
@@ -850,13 +884,19 @@ impl GraphView {
                 io::Error::new(io::ErrorKind::NotFound, "parent folder disappeared")
             })?;
             if node.is_placeholder || !node.is_dir {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "parent is not a folder"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "parent is not a folder",
+                ));
             }
             node.path.clone()
         };
         let destination = parent_path.join(name);
         if destination.exists() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "name already exists"));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "name already exists",
+            ));
         }
         fs::create_dir(&destination)?;
         let message = format!("NEW · 🖿 {name}");
@@ -873,15 +913,24 @@ impl GraphView {
                 io::Error::new(io::ErrorKind::NotFound, "parent folder disappeared")
             })?;
             if node.is_placeholder || node.is_removed || node.hidden || !node.is_dir {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "parent is not a folder"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "parent is not a folder",
+                ));
             }
             node.path.clone()
         };
         let destination = parent_path.join(name);
         if destination.exists() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "name already exists"));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "name already exists",
+            ));
         }
-        fs::OpenOptions::new().write(true).create_new(true).open(&destination)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)?;
         let message = format!("NEW · 🖹 {name}");
         self.reload()?;
         Ok(message)
@@ -890,23 +939,34 @@ impl GraphView {
     pub fn rename_node(&mut self, source: usize, name: &str) -> io::Result<String> {
         validate_name(name)?;
         if source == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot rename mount root"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot rename mount root",
+            ));
         }
-        let node = self.node(source).cloned().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "source node disappeared")
-        })?;
+        let node = self
+            .node(source)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source node disappeared"))?;
         if node.is_placeholder {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot rename placeholder"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot rename placeholder",
+            ));
         }
-        let parent = node.path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "source has no parent")
-        })?;
+        let parent = node
+            .path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no parent"))?;
         let destination = parent.join(name);
         if destination == node.path {
             return Ok(format!("NAME · {}", node.name));
         }
         if destination.exists() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "name already exists"));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "name already exists",
+            ));
         }
         fs::rename(&node.path, &destination)?;
         let message = format!("NAME · {} → {name}", node.name);
@@ -916,15 +976,20 @@ impl GraphView {
 
     pub fn move_node(&mut self, source: usize, target: usize) -> io::Result<String> {
         if !self.can_move(source, target) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid folder move"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid folder move",
+            ));
         }
 
-        let src = self.node(source).cloned().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "source node disappeared")
-        })?;
-        let dst = self.node(target).cloned().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "target folder disappeared")
-        })?;
+        let src = self
+            .node(source)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source node disappeared"))?;
+        let dst = self
+            .node(target)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "target folder disappeared"))?;
         let name = src.path.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "source has no file name")
         })?;
@@ -944,14 +1009,21 @@ impl GraphView {
 
     pub fn trash_node(&mut self, source: usize) -> io::Result<String> {
         if source == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot trash root"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot trash root",
+            ));
         }
 
-        let src = self.node(source).cloned().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "source node disappeared")
-        })?;
+        let src = self
+            .node(source)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "source node disappeared"))?;
         if src.is_placeholder {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot trash placeholder"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot trash placeholder",
+            ));
         }
 
         let trash = self.root.join(".explorer-trash");
@@ -1174,13 +1246,15 @@ impl GraphView {
             }
         }
     }
-
 }
 
 fn validate_name(name: &str) -> io::Result<()> {
     let name = name.trim();
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid file/folder name"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid file/folder name",
+        ));
     }
     Ok(())
 }
@@ -1346,15 +1420,27 @@ impl WorldBrailleCanvas {
 
         if dx.abs() >= dy.abs() {
             let middle_x = ((a.x + b.x) * 0.5).round();
-            let p1 = Point { x: middle_x, y: a.y };
-            let p2 = Point { x: middle_x, y: b.y };
+            let p1 = Point {
+                x: middle_x,
+                y: a.y,
+            };
+            let p2 = Point {
+                x: middle_x,
+                y: b.y,
+            };
             self.draw_segment(a, p1);
             self.draw_segment(p1, p2);
             self.draw_segment(p2, b);
         } else {
             let middle_y = ((a.y + b.y) * 0.5).round();
-            let p1 = Point { x: a.x, y: middle_y };
-            let p2 = Point { x: b.x, y: middle_y };
+            let p1 = Point {
+                x: a.x,
+                y: middle_y,
+            };
+            let p2 = Point {
+                x: b.x,
+                y: middle_y,
+            };
             self.draw_segment(a, p1);
             self.draw_segment(p1, p2);
             self.draw_segment(p2, b);
@@ -1443,7 +1529,6 @@ impl WorldBrailleCanvas {
         );
     }
 }
-
 
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
