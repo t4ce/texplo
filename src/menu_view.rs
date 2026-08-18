@@ -30,13 +30,13 @@ pub fn draw_menu(
 
     // One literal gap between the stylized E and N. The extra horizontal cap
     // keeps the close glyph at the physical top-right cell of the 17-col menu.
-    menu_line(frame, menu_x, 0, "┯─ᗰ ☰ ＮＵ╾───┤🯀");
+    menu_line(frame, menu_x, 0, "├─╼ ᗰ ☰ＮＵ╾─┤🯀");
     menu_line(frame, menu_x, 1, "│Use ⌨   Tab  ╰─╮");
-    menu_line(frame, menu_x, 2, "├─Mount        ╾┤");
+    menu_line(frame, menu_x, 2, "├─╼ Mount      ╾┤");
     menu_line(frame, menu_x, 4, blank);
-    menu_line(frame, menu_x, 5, "├─View         ╾┤");
+    menu_line(frame, menu_x, 5, "├─╼ View       ╾┤");
     menu_line(frame, menu_x, 11, "│               ╿");
-    menu_line(frame, menu_x, 12, "├─Act          ╾┤");
+    menu_line(frame, menu_x, 12, "├─╼ Act        ╾┤");
 
     if let Some(index) = MenuState::index_for_command(MenuCommand::Reload) {
         if let Some(y) = MenuState::row_for_index(index, context) {
@@ -83,7 +83,7 @@ pub fn draw_menu(
 
     if let (Some(header), Some(stats)) = (MenuState::stats_header_row(context), stats) {
         if header + 5 < bottom {
-            menu_line(frame, menu_x, header, "├─Stats        ╾┤");
+            menu_line(frame, menu_x, header, "├─╼ Stats      ╾┤");
             let rows = [
                 ("key", stats.key.as_str()),
                 ("size", stats.size.as_str()),
