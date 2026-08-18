@@ -7,7 +7,7 @@ edition = "2024"
 crossterm = { path = "../TRUEOS-Blueprints/vendor/crossterm-0.29.0-trueos", default-features = false, features = ["events"] }
 
 [target.'cfg(any(target_os = "trueos", target_os = "zkvm"))'.dependencies]
-trueos = { path = "../TRUEOS-Blueprints/api", features = ["tokio-runtime"] }
+trueos = { path = "../TRUEOS-Blueprints/api" }
 
 [patch.crates-io]
 mio = { path = "../TRUEOS-Blueprints/vendor/mio-1.2.0" }
