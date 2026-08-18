@@ -1,10 +1,17 @@
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+use std::collections::HashMap;
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+use trueos::collections::HashMap;
 use std::{
-    collections::HashMap,
-    fs,
     io,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
 };
+use crate::chronos::{elapsed_since, Duration, SystemTime};
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+use std::fs;
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+use trueos::async_fs;
 
 use crossterm::style::Color;
 
@@ -18,6 +25,91 @@ const DEPTH_LEVELS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 const DEFAULT_DEPTH_LIMIT: usize = 4;
 const MAX_CHILDREN_PER_DIR: usize = 256;
 const MAX_VISIBLE_NODES: usize = 256;
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn path_to_utf8(path: &Path) -> io::Result<&str> {
+    path.to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8"))
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn trueos_fs_err(op: &str, err: i32) -> io::Error {
+    io::Error::other(format!("{op} failed ({err})"))
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn trueos_exists(path: &Path) -> io::Result<bool> {
+    let path = path_to_utf8(path)?;
+    async_fs::block_on(async_fs::exists(path.as_bytes()))
+        .map_err(|err| trueos_fs_err("exists", err))
+}
+
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+fn trueos_exists(path: &Path) -> io::Result<bool> {
+    Ok(path.exists())
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn trueos_rename(source: &Path, destination: &Path) -> io::Result<()> {
+    let source_path = path_to_utf8(source)?;
+    let metadata = async_fs::block_on(async_fs::metadata(source_path.as_bytes()))
+        .map_err(|err| trueos_fs_err("metadata", err))?;
+    if metadata.is_dir() {
+        trueos_rename_dir(source, destination)?;
+    } else {
+        trueos_rename_file(source, destination)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn trueos_rename_file(source: &Path, destination: &Path) -> io::Result<()> {
+    let source = path_to_utf8(source)?;
+    let destination = path_to_utf8(destination)?;
+    let bytes = async_fs::block_on(async_fs::read_file(source.as_bytes()))
+        .map_err(|err| trueos_fs_err("read_file", err))?;
+    async_fs::block_on(async_fs::write_file(destination.as_bytes(), &bytes))
+        .map_err(|err| trueos_fs_err("write_file", err))?;
+    async_fs::block_on(async_fs::remove(source.as_bytes()))
+        .map_err(|err| trueos_fs_err("remove", err))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn trueos_rename_dir(source: &Path, destination: &Path) -> io::Result<()> {
+    let source_path = path_to_utf8(source)?;
+    let destination_path = path_to_utf8(destination)?;
+    async_fs::block_on(async_fs::create_dir_all(destination_path.as_bytes()))
+        .map_err(|err| trueos_fs_err("create_dir_all", err))?;
+
+    let listing = async_fs::block_on(async_fs::list_dir_utf8(source_path.as_bytes()))
+        .map_err(|err| trueos_fs_err("list_dir_utf8", err))?;
+    for name in listing.lines() {
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        let child_source = source.join(name);
+        let child_destination = destination.join(name);
+        let child_meta = async_fs::block_on(async_fs::metadata(
+            path_to_utf8(&child_source)?.as_bytes(),
+        ))
+        .map_err(|err| trueos_fs_err("metadata", err))?;
+        if child_meta.is_dir() {
+            trueos_rename_dir(&child_source, &child_destination)?;
+        } else {
+            trueos_rename_file(&child_source, &child_destination)?;
+        }
+    }
+
+    async_fs::block_on(async_fs::remove(source_path.as_bytes()))
+        .map_err(|err| trueos_fs_err("remove", err))?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+fn trueos_rename(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Viewport {
@@ -203,9 +295,31 @@ impl GraphView {
     }
 
     pub fn mount_path(&mut self, path: &Path) -> io::Result<()> {
-        let meta = fs::metadata(path)?;
-        if !meta.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "mount target is not a folder"));
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        {
+            let path = path_to_utf8(path)?;
+            let meta = async_fs::block_on(async_fs::metadata(path.as_bytes()))
+                .map_err(|err| trueos_fs_err("metadata", err))?;
+            if !meta.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mount target is not a folder",
+                ));
+            }
+            self.root = PathBuf::from(path);
+            self.center();
+            return self.reload();
+        }
+
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+        {
+            let meta = fs::metadata(path)?;
+            if !meta.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "mount target is not a folder",
+                ));
+            }
         }
         self.root = path.to_path_buf();
         self.center();
@@ -234,7 +348,7 @@ impl GraphView {
             return Ok(false);
         }
 
-        let entries = match fs::read_dir(dir) {
+        let entries = match self.read_dir_entries(dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return Ok(false),
             Err(err) => return Err(err),
@@ -244,26 +358,18 @@ impl GraphView {
         // This keeps an enormous directory from becoming an enormous allocation.
         let mut children = Vec::new();
         let mut directory_truncated = false;
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == ".explorer-trash" {
-                continue;
-            }
-
+        for (mut_is_folder, name, path, is_dir, is_symlink) in entries {
             if children.len() >= MAX_CHILDREN_PER_DIR {
                 directory_truncated = true;
                 break;
             }
 
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
             children.push((
-                !file_type.is_dir(),
+                mut_is_folder,
                 name,
-                entry.path(),
-                file_type.is_dir(),
-                file_type.is_symlink(),
+                path,
+                is_dir,
+                is_symlink,
             ));
         }
 
@@ -318,6 +424,60 @@ impl GraphView {
         }
 
         Ok(false)
+    }
+
+    fn read_dir_entries(
+        &self,
+        dir: &Path,
+    ) -> io::Result<Vec<(bool, String, PathBuf, bool, bool)>> {
+        let mut entries = Vec::new();
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        {
+            let path = dir.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8")
+            })?;
+            let listing = async_fs::block_on(async_fs::list_dir_utf8(path.as_bytes()))
+                .map_err(|err| io::Error::other(format!("list_dir_utf8 failed ({err})")))?;
+            for name in listing.lines() {
+                if name.is_empty() || name == ".explorer-trash" {
+                    continue;
+                }
+                let child_path = dir.join(name);
+                let child_path_str = child_path.to_str().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "child path is not valid UTF-8")
+                })?;
+                let is_dir = async_fs::block_on(async_fs::metadata(child_path_str.as_bytes()))
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false);
+                entries.push((!is_dir, name.to_string(), child_path, is_dir, false));
+            }
+            return Ok(entries);
+        }
+
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+        {
+            let iter = match fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(err) => return Err(err),
+            };
+            for entry in iter.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == ".explorer-trash" {
+                    continue;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                entries.push((
+                    !file_type.is_dir(),
+                    name,
+                    entry.path(),
+                    file_type.is_dir(),
+                    file_type.is_symlink(),
+                ));
+            }
+            Ok(entries)
+        }
     }
 
     fn push_placeholder(&mut self, parent_id: usize, depth: usize) {
@@ -700,16 +860,35 @@ impl GraphView {
             return None;
         }
 
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        let metadata = match path_to_utf8(&node.path) {
+            Ok(node_path) => async_fs::block_on(async_fs::metadata(node_path.as_bytes())).ok(),
+            Err(_) => None,
+        };
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
         let metadata = fs::metadata(&node.path).ok();
+
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        let size = metadata
+            .as_ref()
+            .map(|meta| human_bytes(meta.len))
+            .unwrap_or_else(|| "?".to_string());
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
         let size = metadata
             .as_ref()
             .map(|meta| human_bytes(meta.len()))
             .unwrap_or_else(|| "?".to_string());
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        let modified = "?".to_string();
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
         let modified = metadata
             .as_ref()
             .and_then(|meta| meta.modified().ok())
             .map(relative_age)
             .unwrap_or_else(|| "?".to_string());
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        let access = "?".to_string();
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
         let access = metadata
             .as_ref()
             .map(|meta| if meta.permissions().readonly() { "read only" } else { "read/write" })
@@ -855,9 +1034,17 @@ impl GraphView {
             node.path.clone()
         };
         let destination = parent_path.join(name);
-        if destination.exists() {
+        if trueos_exists(&destination)? {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "name already exists"));
         }
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        {
+            async_fs::block_on(async_fs::create_dir_all(
+                path_to_utf8(&destination)?.as_bytes(),
+            ))
+            .map_err(|err| trueos_fs_err("create_dir_all", err))?;
+        }
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
         fs::create_dir(&destination)?;
         let message = format!("NEW · 🖿 {name}");
         self.reload()?;
@@ -878,9 +1065,18 @@ impl GraphView {
             node.path.clone()
         };
         let destination = parent_path.join(name);
-        if destination.exists() {
+        if trueos_exists(&destination)? {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "name already exists"));
         }
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        {
+            async_fs::block_on(async_fs::write_file(
+                path_to_utf8(&destination)?.as_bytes(),
+                b"",
+            ))
+            .map_err(|err| trueos_fs_err("write_file", err))?;
+        }
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
         fs::OpenOptions::new().write(true).create_new(true).open(&destination)?;
         let message = format!("NEW · 🖹 {name}");
         self.reload()?;
@@ -905,10 +1101,10 @@ impl GraphView {
         if destination == node.path {
             return Ok(format!("NAME · {}", node.name));
         }
-        if destination.exists() {
+        if trueos_exists(&destination)? {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "name already exists"));
         }
-        fs::rename(&node.path, &destination)?;
+        trueos_rename(&node.path, &destination)?;
         let message = format!("NAME · {} → {name}", node.name);
         self.reload()?;
         Ok(message)
@@ -929,14 +1125,14 @@ impl GraphView {
             io::Error::new(io::ErrorKind::InvalidInput, "source has no file name")
         })?;
         let destination = dst.path.join(name);
-        if destination.exists() {
+        if trueos_exists(&destination)? {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("{} already exists in {}", src.name, dst.name),
             ));
         }
 
-        fs::rename(&src.path, &destination)?;
+        trueos_rename(&src.path, &destination)?;
         let message = format!("MOVE · {} → {}", src.name, dst.name);
         self.reload()?;
         Ok(message)
@@ -955,6 +1151,12 @@ impl GraphView {
         }
 
         let trash = self.root.join(".explorer-trash");
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        {
+            async_fs::block_on(async_fs::create_dir_all(path_to_utf8(&trash)?.as_bytes()))
+                .map_err(|err| trueos_fs_err("create_dir_all", err))?;
+        }
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
         fs::create_dir_all(&trash)?;
 
         let original = src.path.file_name().ok_or_else(|| {
@@ -962,7 +1164,7 @@ impl GraphView {
         })?;
         let mut destination = trash.join(original);
 
-        if destination.exists() {
+        if trueos_exists(&destination)? {
             let stem = src
                 .path
                 .file_stem()
@@ -975,13 +1177,13 @@ impl GraphView {
                     _ => format!("{stem}.{n}"),
                 };
                 destination = trash.join(candidate);
-                if !destination.exists() {
+                if !trueos_exists(&destination)? {
                     break;
                 }
             }
         }
 
-        fs::rename(&src.path, &destination)?;
+        trueos_rename(&src.path, &destination)?;
 
         // Keep the current world layout stable after deletion. The deleted node
         // remains as a non-interactive tombstone until the next explicit reload,
@@ -1463,9 +1665,7 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn relative_age(when: SystemTime) -> String {
-    let elapsed = SystemTime::now()
-        .duration_since(when)
-        .unwrap_or(Duration::ZERO);
+    let elapsed = elapsed_since(when);
     let secs = elapsed.as_secs();
     if secs < 60 {
         format!("{}s ago", secs)

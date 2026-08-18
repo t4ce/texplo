@@ -1,6 +1,7 @@
 mod actions;
 mod graph_view;
 mod layout;
+mod chronos;
 mod menu_view;
 mod minimap;
 mod screen;
