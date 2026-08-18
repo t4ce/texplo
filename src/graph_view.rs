@@ -1,17 +1,20 @@
 use std::{
+    collections::HashMap,
     fs,
     io,
     path::{Path, PathBuf},
 };
 
-use crossterm::{
-    cursor::MoveTo,
-    queue,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
-};
-use std::io::{Stdout, Write};
+use crossterm::style::Color;
 
-const MAX_DEPTH: usize = 256;
+use crate::{
+    layout::{self, LayoutMode, LayoutNode, WorldPos},
+    screen::{text_cell_width, terminal_cell_width, Frame, Style},
+};
+
+const HARD_MAX_DEPTH: usize = 256;
+const DEPTH_LEVELS: [usize; 5] = [0, 2, 4, 6, 8];
+const DEFAULT_DEPTH_LIMIT: usize = 4;
 const MAX_CHILDREN_PER_DIR: usize = 256;
 const MAX_VISIBLE_NODES: usize = 256;
 
@@ -48,23 +51,29 @@ pub struct FsNode {
     pub name: String,
     pub is_dir: bool,
     pub is_placeholder: bool,
+    pub is_removed: bool,
+    hidden: bool,
     depth: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct WorldPos {
+#[derive(Clone, Copy, Debug)]
+struct EdgeCell {
     x: i32,
     y: i32,
+    mask: u8,
 }
 
 pub struct GraphView {
     root: PathBuf,
     nodes: Vec<FsNode>,
     positions: Vec<WorldPos>,
+    edge_cells: Vec<EdgeCell>,
     camera_x: i32,
     camera_y: i32,
     column_gap: i32,
-    row_gap: i32,
+    layout_mode: LayoutMode,
+    suppressed_parent_edges: Vec<bool>,
+    depth_limit: usize,
 }
 
 impl GraphView {
@@ -74,10 +83,13 @@ impl GraphView {
             root,
             nodes: Vec::new(),
             positions: Vec::new(),
+            edge_cells: Vec::new(),
             camera_x: 0,
             camera_y: 0,
             column_gap: 18,
-            row_gap: 2,
+            layout_mode: LayoutMode::Tree,
+            suppressed_parent_edges: Vec::new(),
+            depth_limit: DEFAULT_DEPTH_LIMIT,
         };
         view.reload()?;
         Ok(view)
@@ -103,6 +115,8 @@ impl GraphView {
             name: root_name,
             is_dir: true,
             is_placeholder: false,
+            is_removed: false,
+            hidden: false,
             depth: 0,
         });
 
@@ -126,6 +140,33 @@ impl GraphView {
         Ok(true)
     }
 
+    pub fn mount_node(&mut self, id: usize) -> io::Result<()> {
+        let node = self.node(id).cloned().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "folder disappeared")
+        })?;
+        if node.is_placeholder || node.is_removed || node.hidden || !node.is_dir {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a folder"));
+        }
+        self.mount_path(&node.path)
+    }
+
+    pub fn mount_path(&mut self, path: &Path) -> io::Result<()> {
+        let meta = fs::metadata(path)?;
+        if !meta.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "mount target is not a folder"));
+        }
+        self.root = path.to_path_buf();
+        self.center();
+        self.reload()
+    }
+
+    pub fn find_node_by_path(&self, path: &Path) -> Option<usize> {
+        self.nodes
+            .iter()
+            .find(|node| !node.is_placeholder && !node.is_removed && !node.hidden && node.path == path)
+            .map(|node| node.id)
+    }
+
     fn scan_dir(
         &mut self,
         parent_id: usize,
@@ -133,8 +174,11 @@ impl GraphView {
         depth: usize,
         remaining: &mut usize,
     ) -> io::Result<bool> {
-        if depth > MAX_DEPTH {
-            self.push_placeholder(parent_id, depth);
+        // depth_limit counts nested levels *after* the immediate children of
+        // the mounted directory. Thus depth 0 still renders direct siblings,
+        // while depth 4 renders filesystem depths 1 through 5.
+        let max_visible_depth = self.depth_limit.saturating_add(1).min(HARD_MAX_DEPTH);
+        if depth > max_visible_depth {
             return Ok(false);
         }
 
@@ -192,6 +236,8 @@ impl GraphView {
                 name,
                 is_dir,
                 is_placeholder: false,
+                is_removed: false,
+                hidden: false,
                 depth,
             });
             *remaining -= 1;
@@ -239,54 +285,105 @@ impl GraphView {
             name: "...".to_string(),
             is_dir: false,
             is_placeholder: true,
+            is_removed: false,
+            hidden: false,
             depth,
         });
     }
 
     fn rebuild_layout(&mut self) {
-        self.positions = vec![WorldPos::default(); self.nodes.len()];
-        let mut next_leaf = 0_i32;
-        self.place_subtree(0, &mut next_leaf);
-
-        // Normalize around the hidden structural root. Its direct children then
-        // become independent islands at x=0, with no visible root boundary.
-        if let Some(root) = self.positions.first().copied() {
-            for pos in &mut self.positions {
-                pos.x -= root.x;
-                pos.y -= root.y;
-            }
-        }
-    }
-
-    fn place_subtree(&mut self, id: usize, next_leaf: &mut i32) -> i32 {
-        let depth = self.nodes[id].depth.saturating_sub(1) as i32;
-        let children: Vec<usize> = self
+        let layout_nodes: Vec<LayoutNode> = self
             .nodes
             .iter()
-            .filter(|n| n.parent == Some(id))
-            .map(|n| n.id)
+            .map(|node| LayoutNode {
+                id: node.id,
+                parent: node.parent,
+                depth: node.depth,
+                visual_width: if node.is_placeholder {
+                    3
+                } else {
+                    // icon + one separating space + filename/folder name
+                    2 + node.name.chars().count()
+                },
+                is_dir: node.is_dir,
+            })
             .collect();
 
-        let y = if children.is_empty() {
-            let y = *next_leaf * self.row_gap;
-            *next_leaf += 1;
-            y
-        } else {
-            let mut first = None;
-            let mut last = 0;
-            for child in children {
-                let cy = self.place_subtree(child, next_leaf);
-                first.get_or_insert(cy);
-                last = cy;
-            }
-            (first.unwrap_or(last) + last) / 2
+        self.positions = match self.layout_mode {
+            LayoutMode::Tree => layout::tree_layout(&layout_nodes, self.column_gap),
+            LayoutMode::Radial => layout::radial_layout(&layout_nodes, self.column_gap),
         };
+        self.suppressed_parent_edges = match self.layout_mode {
+            LayoutMode::Tree => layout::tree_suppressed_parent_edges(&layout_nodes),
+            LayoutMode::Radial => vec![false; layout_nodes.len()],
+        };
+        self.rebuild_edge_cache();
+    }
 
-        self.positions[id] = WorldPos {
-            x: depth * self.column_gap,
-            y,
-        };
-        y
+    fn rebuild_edge_cache(&mut self) {
+        let mut braille = WorldBrailleCanvas::new();
+        for node in &self.nodes {
+            if node.hidden {
+                continue;
+            }
+            let Some(parent_id) = node.parent else {
+                continue;
+            };
+            if parent_id == 0 || self.node(parent_id).map(|parent| parent.hidden).unwrap_or(true) {
+                continue;
+            }
+            if self.layout_mode == LayoutMode::Tree
+                && self
+                    .suppressed_parent_edges
+                    .get(node.id)
+                    .copied()
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let Some(parent_pos) = self.positions.get(parent_id).copied() else {
+                continue;
+            };
+            let Some(child_pos) = self.positions.get(node.id).copied() else {
+                continue;
+            };
+            let parent = (parent_pos.x, parent_pos.y);
+            let child = (child_pos.x, child_pos.y);
+            let a = edge_anchor(
+                parent,
+                self.node_width(parent_id),
+                child,
+                self.node_width(node.id),
+            );
+            let b = edge_anchor(
+                child,
+                self.node_width(node.id),
+                parent,
+                self.node_width(parent_id),
+            );
+
+            match self.layout_mode {
+                LayoutMode::Tree => braille.draw_s_curve(a, b),
+                LayoutMode::Radial => braille.draw_radial_spline(a, b),
+            }
+        }
+        self.edge_cells = braille.into_cells();
+    }
+
+    pub fn set_layout_mode(&mut self, mode: LayoutMode) -> bool {
+        if self.layout_mode == mode {
+            self.center();
+            return false;
+        }
+        self.layout_mode = mode;
+        self.rebuild_layout();
+        self.center();
+        true
+    }
+
+    pub fn layout_mode(&self) -> LayoutMode {
+        self.layout_mode
     }
 
     pub fn center(&mut self) {
@@ -306,6 +403,21 @@ impl GraphView {
     pub fn pan(&mut self, dx: i32, dy: i32) {
         self.camera_x += dx;
         self.camera_y += dy;
+    }
+
+
+    pub fn depth_limit(&self) -> usize {
+        self.depth_limit
+    }
+
+    pub fn cycle_depth(&mut self) -> io::Result<usize> {
+        let current = DEPTH_LEVELS
+            .iter()
+            .position(|value| *value == self.depth_limit)
+            .unwrap_or_else(|| DEPTH_LEVELS.iter().position(|value| *value == DEFAULT_DEPTH_LIMIT).unwrap_or(0));
+        self.depth_limit = DEPTH_LEVELS[(current + 1) % DEPTH_LEVELS.len()];
+        self.reload()?;
+        Ok(self.depth_limit)
     }
 
     pub fn cycle_spacing(&mut self) -> i32 {
@@ -342,7 +454,11 @@ impl GraphView {
     fn visual_label(&self, id: usize) -> String {
         self.node(id)
             .map(|n| {
-                if n.is_placeholder {
+                if n.hidden {
+                    String::new()
+                } else if n.is_removed {
+                    "🪦 removed".to_string()
+                } else if n.is_placeholder {
                     "...".to_string()
                 } else {
                     let icon = if n.is_dir { "🖿" } else { "🖹" };
@@ -358,7 +474,7 @@ impl GraphView {
         }
 
         for node in self.nodes.iter().rev() {
-            if node.id == 0 || node.is_placeholder {
+            if node.id == 0 || node.is_placeholder || node.is_removed || node.hidden {
                 continue;
             }
             let Some((sx, sy)) = self.screen_pos(node.id, viewport) else {
@@ -379,12 +495,28 @@ impl GraphView {
         y: u16,
         source: usize,
     ) -> Option<usize> {
-        let target = self.hit_test(viewport, x, y)?;
-        let target_node = self.node(target)?;
-        if !target_node.is_dir || !self.can_move(source, target) {
+        if !viewport.contains(x, y) {
             return None;
         }
-        Some(target)
+
+        // Folder labels remain visually unchanged, but their drop target grows
+        // by one terminal cell on every side. The tree layout reserves extra Y
+        // room between folder siblings so these virtual hit areas stay usable.
+        for node in self.nodes.iter().rev() {
+            if node.id == 0 || node.is_placeholder || node.is_removed || node.hidden || !node.is_dir || !self.can_move(source, node.id) {
+                continue;
+            }
+            let Some((sx, sy)) = self.screen_pos(node.id, viewport) else {
+                continue;
+            };
+            let width = self.node_width(node.id) as i32;
+            let px = x as i32;
+            let py = y as i32;
+            if px >= sx - 1 && px <= sx + width && py >= sy - 1 && py <= sy + 1 {
+                return Some(node.id);
+            }
+        }
+        None
     }
 
     pub fn can_move(&self, source: usize, target: usize) -> bool {
@@ -397,7 +529,7 @@ impl GraphView {
         let Some(dst) = self.node(target) else {
             return false;
         };
-        if src.is_placeholder || dst.is_placeholder || !dst.is_dir || src.parent == Some(target) {
+        if src.is_placeholder || dst.is_placeholder || src.is_removed || dst.is_removed || src.hidden || dst.hidden || !dst.is_dir || src.parent == Some(target) {
             return false;
         }
         if src.is_dir && self.is_descendant(target, source) {
@@ -415,6 +547,56 @@ impl GraphView {
             current = self.node(id).and_then(|n| n.parent);
         }
         false
+    }
+
+    pub fn create_folder(&mut self, parent: usize, name: &str) -> io::Result<String> {
+        validate_name(name)?;
+        let parent_path = if parent == 0 {
+            self.root.clone()
+        } else {
+            let node = self.node(parent).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "parent folder disappeared")
+            })?;
+            if node.is_placeholder || !node.is_dir {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "parent is not a folder"));
+            }
+            node.path.clone()
+        };
+        let destination = parent_path.join(name);
+        if destination.exists() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "name already exists"));
+        }
+        fs::create_dir(&destination)?;
+        let message = format!("NEW · 🖿 {name}");
+        self.reload()?;
+        Ok(message)
+    }
+
+    pub fn rename_node(&mut self, source: usize, name: &str) -> io::Result<String> {
+        validate_name(name)?;
+        if source == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot rename mount root"));
+        }
+        let node = self.node(source).cloned().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "source node disappeared")
+        })?;
+        if node.is_placeholder {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot rename placeholder"));
+        }
+        let parent = node.path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "source has no parent")
+        })?;
+        let destination = parent.join(name);
+        if destination == node.path {
+            return Ok(format!("NAME · {}", node.name));
+        }
+        if destination.exists() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "name already exists"));
+        }
+        fs::rename(&node.path, &destination)?;
+        let message = format!("NAME · {} → {name}", node.name);
+        self.reload()?;
+        Ok(message)
     }
 
     pub fn move_node(&mut self, source: usize, target: usize) -> io::Result<String> {
@@ -485,44 +667,58 @@ impl GraphView {
         }
 
         fs::rename(&src.path, &destination)?;
+
+        // Keep the current world layout stable after deletion. The deleted node
+        // remains as a non-interactive tombstone until the next explicit reload,
+        // mount/parent change, or depth refresh. Descendants of a removed folder
+        // are hidden immediately because they no longer exist at their old paths.
+        if let Some(node) = self.nodes.get_mut(source) {
+            node.is_removed = true;
+        }
+        self.hide_descendants(source);
+
+        // Positions are intentionally untouched. Only connector geometry changes:
+        // edges inside a removed folder vanish, while its parent→tombstone edge may
+        // remain. This is much cheaper than rescanning and laying out the tree.
+        self.rebuild_edge_cache();
+
         let message = format!("TRASH · {} → .explorer-trash/", src.name);
-        self.reload()?;
         Ok(message)
+    }
+
+    fn hide_descendants(&mut self, ancestor: usize) {
+        let mut stack = vec![ancestor];
+        while let Some(parent) = stack.pop() {
+            let children: Vec<usize> = self
+                .nodes
+                .iter()
+                .filter(|node| node.parent == Some(parent))
+                .map(|node| node.id)
+                .collect();
+            for child in children {
+                if let Some(node) = self.nodes.get_mut(child) {
+                    node.hidden = true;
+                }
+                stack.push(child);
+            }
+        }
     }
 
     pub fn render(
         &self,
-        out: &mut Stdout,
+        frame: &mut Frame,
         viewport: Viewport,
         selected: Option<usize>,
         drag_id: Option<usize>,
         drop_target: Option<usize>,
-    ) -> io::Result<()> {
-        // Root-to-child edges are intentionally omitted: every direct child of
-        // the mount root is a separate visible island.
-        for node in &self.nodes {
-            let Some(parent_id) = node.parent else {
-                continue;
-            };
-            if parent_id == 0 {
-                continue;
-            }
-            let Some((px, py)) = self.screen_pos(parent_id, viewport) else {
-                continue;
-            };
-            let Some((cx, cy)) = self.screen_pos(node.id, viewport) else {
-                continue;
-            };
-
-            let parent_end = px + self.node_width(parent_id) as i32;
-            let elbow = (cx - 2).max(parent_end + 1);
-            self.draw_h(out, viewport, parent_end, elbow, py, '─')?;
-            self.draw_v(out, viewport, elbow, py, cy, '│')?;
-            self.draw_h(out, viewport, elbow, cx - 1, cy, '─')?;
-        }
+    ) {
+        // Connector geometry is cached in world space whenever the directory,
+        // layout mode, or spacing changes. Panning and resize only translate and
+        // clip these cached Braille cells.
+        self.render_edges(frame, viewport);
 
         for node in &self.nodes {
-            if node.id == 0 {
+            if node.id == 0 || node.hidden {
                 continue;
             }
             let Some((sx, sy)) = self.screen_pos(node.id, viewport) else {
@@ -533,33 +729,53 @@ impl GraphView {
             }
 
             let label = self.visual_label(node.id);
-            let mut fg = Color::Grey;
-            let mut bg = Color::Reset;
+            let mut style = Style::new(Color::Grey, Color::Reset);
 
-            if node.is_placeholder {
-                fg = Color::DarkGrey;
+            if node.is_removed || node.is_placeholder {
+                style = Style::new(Color::DarkGrey, Color::Reset);
             } else if node.is_dir {
-                fg = Color::Black;
-                bg = Color::White;
+                style = Style::new(Color::Black, Color::White);
             }
-            if selected == Some(node.id) {
-                fg = Color::Black;
-                bg = Color::DarkYellow;
+            if !node.is_removed && selected == Some(node.id) {
+                style = Style::new(Color::Black, Color::DarkYellow);
             }
-            if drop_target == Some(node.id) {
-                fg = Color::Black;
-                bg = Color::Cyan;
+            if !node.is_removed && drop_target == Some(node.id) {
+                style = Style::new(Color::Black, Color::Cyan);
             }
-            if drag_id == Some(node.id) {
-                fg = Color::DarkGrey;
-                bg = Color::Reset;
+            if !node.is_removed && drag_id == Some(node.id) {
+                style = Style::new(Color::DarkGrey, Color::Reset);
             }
 
-            self.print_clipped(out, viewport, sx, sy, &label, fg, bg)?;
+            self.print_clipped(frame, viewport, sx, sy, &label, style);
         }
+    }
 
-        queue!(out, ResetColor)?;
-        Ok(())
+    fn render_edges(&self, frame: &mut Frame, viewport: Viewport) {
+        let (origin_x, origin_y) = self.screen_origin(viewport);
+        let offset_x = origin_x + self.camera_x;
+        let offset_y = origin_y + self.camera_y;
+        let style = Style::new(Color::DarkGrey, Color::Reset);
+
+        // edge_cells is sorted by (world_y, world_x). Convert the visible screen
+        // band back to world rows and binary-search directly into the cache. A pan
+        // therefore walks only connector cells that can actually reach the current
+        // viewport instead of rescanning the complete graph.
+        let world_top = viewport.y as i32 - offset_y;
+        let world_bottom = viewport.bottom().saturating_sub(1) as i32 - offset_y;
+        let first = self.edge_cells.partition_point(|cell| cell.y < world_top);
+
+        for cell in &self.edge_cells[first..] {
+            if cell.y > world_bottom {
+                break;
+            }
+            let screen_x = offset_x + cell.x;
+            if screen_x < viewport.x as i32 || screen_x >= viewport.right() as i32 {
+                continue;
+            }
+            let screen_y = offset_y + cell.y;
+            let ch = char::from_u32(0x2800 + cell.mask as u32).unwrap_or(' ');
+            frame.put_i32(screen_x, screen_y, ch, style);
+        }
     }
 
     pub fn screen_y(&self, id: usize, viewport: Viewport) -> Option<u16> {
@@ -572,98 +788,278 @@ impl GraphView {
 
     fn screen_pos(&self, id: usize, viewport: Viewport) -> Option<(i32, i32)> {
         let p = *self.positions.get(id)?;
-        let origin_x = viewport.x as i32 + 2;
-        let origin_y = viewport.y as i32 + (viewport.height as i32 / 2);
+        let (origin_x, origin_y) = self.screen_origin(viewport);
         Some((
             origin_x + p.x + self.camera_x,
             origin_y + p.y + self.camera_y,
         ))
     }
 
+    fn screen_origin(&self, viewport: Viewport) -> (i32, i32) {
+        match self.layout_mode {
+            LayoutMode::Tree => (
+                viewport.x as i32 + 2,
+                viewport.y as i32 + (viewport.height as i32 / 2),
+            ),
+            LayoutMode::Radial => (
+                viewport.x as i32 + (viewport.width as i32 / 2),
+                viewport.y as i32 + (viewport.height as i32 / 2),
+            ),
+        }
+    }
+
     fn node_width(&self, id: usize) -> usize {
-        self.visual_label(id).chars().count().max(1)
-    }
-
-    fn draw_h(
-        &self,
-        out: &mut Stdout,
-        viewport: Viewport,
-        x0: i32,
-        x1: i32,
-        y: i32,
-        ch: char,
-    ) -> io::Result<()> {
-        if y < viewport.y as i32 || y >= viewport.bottom() as i32 {
-            return Ok(());
-        }
-        let start = x0.min(x1).max(viewport.x as i32);
-        let end = x0.max(x1).min(viewport.right() as i32 - 1);
-        for x in start..=end {
-            queue!(
-                out,
-                MoveTo(x as u16, y as u16),
-                SetForegroundColor(Color::DarkGrey),
-                Print(ch)
-            )?;
-        }
-        Ok(())
-    }
-
-    fn draw_v(
-        &self,
-        out: &mut Stdout,
-        viewport: Viewport,
-        x: i32,
-        y0: i32,
-        y1: i32,
-        ch: char,
-    ) -> io::Result<()> {
-        if x < viewport.x as i32 || x >= viewport.right() as i32 {
-            return Ok(());
-        }
-        let start = y0.min(y1).max(viewport.y as i32);
-        let end = y0.max(y1).min(viewport.bottom() as i32 - 1);
-        for y in start..=end {
-            queue!(
-                out,
-                MoveTo(x as u16, y as u16),
-                SetForegroundColor(Color::DarkGrey),
-                Print(ch)
-            )?;
-        }
-        Ok(())
+        self.node(id)
+            .map(|node| {
+                if node.hidden {
+                    0
+                } else if node.is_removed {
+                    text_cell_width("🪦 removed")
+                } else if node.is_placeholder {
+                    3
+                } else {
+                    2 + node.name.chars().count()
+                }
+            })
+            .unwrap_or(1)
+            .max(1)
     }
 
     fn print_clipped(
         &self,
-        out: &mut Stdout,
+        frame: &mut Frame,
         viewport: Viewport,
         x: i32,
         y: i32,
         text: &str,
-        fg: Color,
-        bg: Color,
-    ) -> io::Result<()> {
+        style: Style,
+    ) {
         if y < viewport.y as i32 || y >= viewport.bottom() as i32 {
-            return Ok(());
+            return;
         }
 
-        let mut sx = x;
+        let mut screen_x = x;
         for ch in text.chars() {
-            if sx >= viewport.x as i32 && sx < viewport.right() as i32 {
-                queue!(
-                    out,
-                    MoveTo(sx as u16, y as u16),
-                    SetForegroundColor(fg),
-                    SetBackgroundColor(bg),
-                    Print(ch)
-                )?;
+            let glyph_width = terminal_cell_width(ch) as i32;
+            let glyph_right = screen_x + glyph_width;
+
+            // Do not paint half of a wide glyph at the viewport boundary.
+            if screen_x >= viewport.x as i32 && glyph_right <= viewport.right() as i32 {
+                frame.put_display_i32(screen_x, y, ch, style);
             }
-            sx += 1;
-            if sx >= viewport.right() as i32 {
+
+            screen_x = glyph_right;
+            if screen_x >= viewport.right() as i32 {
                 break;
             }
         }
-        Ok(())
+    }
+
+}
+
+fn validate_name(name: &str) -> io::Result<()> {
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid file/folder name"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+fn edge_anchor(
+    from: (i32, i32),
+    from_width: usize,
+    toward: (i32, i32),
+    toward_width: usize,
+) -> Point {
+    let fx = from.0 as f64 + from_width as f64 * 0.5;
+    let fy = from.1 as f64 + 0.5;
+    let tx = toward.0 as f64 + toward_width as f64 * 0.5;
+    let ty = toward.1 as f64 + 0.5;
+    let dx = tx - fx;
+    let dy = ty - fy;
+
+    if dx.abs() > dy.abs() * 1.7 {
+        Point {
+            x: if dx > 0.0 {
+                from.0 as f64 + from_width as f64 + 0.15
+            } else {
+                from.0 as f64 - 0.15
+            },
+            y: fy,
+        }
+    } else {
+        Point {
+            x: fx,
+            y: if dy > 0.0 {
+                from.1 as f64 + 1.05
+            } else {
+                from.1 as f64 - 0.05
+            },
+        }
+    }
+}
+
+/// Sparse world-space Braille mask cache. Each terminal cell owns a 2x4 dot
+/// grid. It is rebuilt only when the filesystem or layout changes; camera motion
+/// simply translates and clips the cached cells.
+struct WorldBrailleCanvas {
+    masks: HashMap<(i32, i32), u8>,
+}
+
+impl WorldBrailleCanvas {
+    fn new() -> Self {
+        Self {
+            masks: HashMap::new(),
+        }
+    }
+
+    fn into_cells(self) -> Vec<EdgeCell> {
+        let mut cells: Vec<EdgeCell> = self
+            .masks
+            .into_iter()
+            .filter_map(|((x, y), mask)| (mask != 0).then_some(EdgeCell { x, y, mask }))
+            .collect();
+        cells.sort_unstable_by_key(|cell| (cell.y, cell.x));
+        cells
+    }
+
+    fn to_dot(point: Point) -> Point {
+        Point {
+            x: point.x * 2.0,
+            y: point.y * 4.0,
+        }
+    }
+
+    fn set_dot(&mut self, x: f64, y: f64) {
+        let x = x.round() as i32;
+        let y = y.round() as i32;
+        let cell_x = x.div_euclid(2);
+        let cell_y = y.div_euclid(4);
+        let local_x = x.rem_euclid(2) as usize;
+        let local_y = y.rem_euclid(4) as usize;
+        let bit_table = [[0_u8, 3_u8], [1, 4], [2, 5], [6, 7]];
+        let bit = bit_table[local_y][local_x];
+        *self.masks.entry((cell_x, cell_y)).or_insert(0) |= 1 << bit;
+    }
+
+    fn draw_segment(&mut self, a: Point, b: Point) {
+        let mut x0 = a.x.round() as i32;
+        let mut y0 = a.y.round() as i32;
+        let x1 = b.x.round() as i32;
+        let y1 = b.y.round() as i32;
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+
+        loop {
+            self.set_dot(x0 as f64, y0 as f64);
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+            let e2 = err * 2;
+            if e2 >= dy {
+                err += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+
+    fn sample_cubic(&mut self, a: Point, c1: Point, c2: Point, b: Point) {
+        let distance = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+        let steps = ((distance / 1.9).ceil() as usize).clamp(10, 512);
+        let mut previous = a;
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let mt = 1.0 - t;
+            let point = Point {
+                x: mt * mt * mt * a.x
+                    + 3.0 * mt * mt * t * c1.x
+                    + 3.0 * mt * t * t * c2.x
+                    + t * t * t * b.x,
+                y: mt * mt * mt * a.y
+                    + 3.0 * mt * mt * t * c1.y
+                    + 3.0 * mt * t * t * c2.y
+                    + t * t * t * b.y,
+            };
+            self.draw_segment(previous, point);
+            previous = point;
+        }
+    }
+
+    fn draw_s_curve(&mut self, a: Point, b: Point) {
+        let a = Self::to_dot(a);
+        let b = Self::to_dot(b);
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+
+        if dx.abs() >= dy.abs() {
+            self.sample_cubic(
+                a,
+                Point {
+                    x: a.x + dx * 0.42,
+                    y: a.y,
+                },
+                Point {
+                    x: b.x - dx * 0.42,
+                    y: b.y,
+                },
+                b,
+            );
+        } else {
+            self.sample_cubic(
+                a,
+                Point {
+                    x: a.x,
+                    y: a.y + dy * 0.42,
+                },
+                Point {
+                    x: b.x,
+                    y: b.y - dy * 0.42,
+                },
+                b,
+            );
+        }
+    }
+
+    fn draw_radial_spline(&mut self, a: Point, b: Point) {
+        let a = Self::to_dot(a);
+        let b = Self::to_dot(b);
+        let al = (a.x.powi(2) + a.y.powi(2)).sqrt().max(1.0);
+        let bl = (b.x.powi(2) + b.y.powi(2)).sqrt().max(1.0);
+        let au = Point {
+            x: a.x / al,
+            y: a.y / al,
+        };
+        let bu = Point {
+            x: b.x / bl,
+            y: b.y / bl,
+        };
+        let distance = ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt();
+        let reach = (distance * 0.36).max(5.0);
+
+        self.sample_cubic(
+            a,
+            Point {
+                x: a.x + au.x * reach,
+                y: a.y + au.y * reach,
+            },
+            Point {
+                x: b.x - bu.x * reach,
+                y: b.y - bu.y * reach,
+            },
+            b,
+        );
     }
 }

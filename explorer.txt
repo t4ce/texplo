@@ -15,12 +15,12 @@
 ...
 
 Drag box for Testfile.txt and Folder
-🖹 ╾──────╮
+  ╾──────╮
 ╿Testfile│
-╰────────╯
-🖿 ╾──────╮
+╰────────🖹
+  ╾──────╮
 ╿Testfold│
-╰────────╯
+╰────────🖿
 
 MainMenu	
 ┯─╼ Menu ╾──╮
@@ -42,7 +42,7 @@ Actions
 │🯱   zip         │
 │🯲   remove      │
 │🯳               │
-│🯴               │
+│🯴               │ 🖿 🖹
 ╰────────────────╯
 
 SelectionMenuFile

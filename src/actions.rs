@@ -1,20 +1,26 @@
-use std::io::{self, Stdout, Write};
-
-use crossterm::{
-    cursor::MoveTo,
-    queue,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+use std::{
+    io,
+    path::PathBuf,
 };
 
-use crate::graph_view::{GraphView, Viewport};
+use crossterm::style::Color;
+
+use crate::{
+    graph_view::{GraphView, Viewport},
+    layout::LayoutMode,
+    screen::{Frame, Style},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuCommand {
     Reload,
     Parent,
     TreeLayout,
+    RadialLayout,
     Spacing,
+    Depth,
     Center,
+    Enter,
     Sha256,
     Zip,
     Rename,
@@ -23,78 +29,259 @@ pub enum MenuCommand {
     Exit,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct MenuEntry {
-    pub hotkey: Option<char>,
-    pub glyph: &'static str,
-    pub label: &'static str,
-    pub command: MenuCommand,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuContext {
+    None,
+    File,
+    Folder,
 }
 
-pub const MENU_ENTRIES: [MenuEntry; 11] = [
-    MenuEntry { hotkey: Some('0'), glyph: "🯰", label: "reload", command: MenuCommand::Reload },
-    MenuEntry { hotkey: Some('1'), glyph: "🯱", label: "parent", command: MenuCommand::Parent },
-    MenuEntry { hotkey: Some('2'), glyph: "🯲", label: "tree layout", command: MenuCommand::TreeLayout },
-    MenuEntry { hotkey: Some('3'), glyph: "🯳", label: "spacing", command: MenuCommand::Spacing },
-    MenuEntry { hotkey: None, glyph: "⌂", label: "center (home)", command: MenuCommand::Center },
-    MenuEntry { hotkey: Some('4'), glyph: "🯴", label: "sha256", command: MenuCommand::Sha256 },
-    MenuEntry { hotkey: Some('5'), glyph: "🯵", label: "zip", command: MenuCommand::Zip },
-    MenuEntry { hotkey: Some('6'), glyph: "🯶", label: "rename", command: MenuCommand::Rename },
-    MenuEntry { hotkey: Some('7'), glyph: "🯷", label: "new folder", command: MenuCommand::NewFolder },
-    MenuEntry { hotkey: Some('8'), glyph: "🯸", label: "delete", command: MenuCommand::Delete },
-    MenuEntry { hotkey: Some('9'), glyph: "🯹", label: "exit (esc)", command: MenuCommand::Exit },
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuSection {
+    Mount,
+    View,
+    Action,
+}
+
+impl MenuSection {
+    const ORDER: [Self; 3] = [Self::Mount, Self::View, Self::Action];
+
+    fn stepped(self, reverse: bool) -> Self {
+        let current = Self::ORDER.iter().position(|section| *section == self).unwrap_or(0);
+        let next = if reverse {
+            (current + Self::ORDER.len() - 1) % Self::ORDER.len()
+        } else {
+            (current + 1) % Self::ORDER.len()
+        };
+        Self::ORDER[next]
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MenuEntry {
+    pub label: &'static str,
+    pub command: MenuCommand,
+    pub section: MenuSection,
+}
+
+pub const MENU_ENTRIES: [MenuEntry; 14] = [
+    MenuEntry { label: "reload", command: MenuCommand::Reload, section: MenuSection::Mount },
+    MenuEntry { label: "parent", command: MenuCommand::Parent, section: MenuSection::Mount },
+    MenuEntry { label: "tree layout", command: MenuCommand::TreeLayout, section: MenuSection::View },
+    MenuEntry { label: "radial layout", command: MenuCommand::RadialLayout, section: MenuSection::View },
+    MenuEntry { label: "spacing", command: MenuCommand::Spacing, section: MenuSection::View },
+    MenuEntry { label: "depth", command: MenuCommand::Depth, section: MenuSection::View },
+    MenuEntry { label: "center (home)", command: MenuCommand::Center, section: MenuSection::View },
+    MenuEntry { label: "enter", command: MenuCommand::Enter, section: MenuSection::Action },
+    MenuEntry { label: "sha256", command: MenuCommand::Sha256, section: MenuSection::Action },
+    MenuEntry { label: "zip", command: MenuCommand::Zip, section: MenuSection::Action },
+    MenuEntry { label: "name", command: MenuCommand::Rename, section: MenuSection::Action },
+    MenuEntry { label: "new 🖿", command: MenuCommand::NewFolder, section: MenuSection::Action },
+    MenuEntry { label: "🗑", command: MenuCommand::Delete, section: MenuSection::Action },
+    MenuEntry { label: "exit (esc)", command: MenuCommand::Exit, section: MenuSection::Action },
 ];
+
+#[derive(Clone, Debug)]
+pub struct MenuLink {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+impl MenuLink {
+    pub fn label(&self) -> String {
+        let icon = if self.is_dir { "🖿" } else { "🖹" };
+        let name = self
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.path.display().to_string());
+        format!("{icon} {name}")
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MenuState {
     pub cursor: usize,
+    pub section: MenuSection,
 }
 
 impl Default for MenuState {
     fn default() -> Self {
-        Self { cursor: 0 }
+        Self {
+            cursor: MenuState::index_for_command(MenuCommand::NewFolder).unwrap_or(0),
+            section: MenuSection::Action,
+        }
     }
 }
 
 impl MenuState {
-    pub fn set_cursor(&mut self, index: usize) -> bool {
-        if index < MENU_ENTRIES.len() && self.cursor != index {
-            self.cursor = index;
-            true
-        } else {
-            false
+    pub fn set_cursor(&mut self, index: usize, context: MenuContext) -> bool {
+        if index >= MENU_ENTRIES.len() || !Self::is_visible(index, context) {
+            return false;
+        }
+        let next_section = MENU_ENTRIES[index].section;
+        let changed = self.cursor != index || self.section != next_section;
+        self.cursor = index;
+        self.section = next_section;
+        changed
+    }
+
+    pub fn ensure_visible(&mut self, context: MenuContext) -> bool {
+        if Self::is_visible(self.cursor, context) && MENU_ENTRIES[self.cursor].section == self.section {
+            return false;
+        }
+
+        let next = Self::first_visible_in_section(self.section, context)
+            .or_else(|| {
+                let mut section = self.section;
+                for _ in 0..2 {
+                    section = section.stepped(false);
+                    if let Some(index) = Self::first_visible_in_section(section, context) {
+                        return Some(index);
+                    }
+                }
+                None
+            })
+            .unwrap_or(0);
+        let changed = self.cursor != next || self.section != MENU_ENTRIES[next].section;
+        self.cursor = next;
+        self.section = MENU_ENTRIES[next].section;
+        changed
+    }
+
+    pub fn cycle_section(&mut self, reverse: bool, context: MenuContext) -> bool {
+        let mut section = self.section;
+        for _ in 0..3 {
+            section = section.stepped(reverse);
+            if let Some(index) = Self::first_visible_in_section(section, context) {
+                let changed = self.section != section || self.cursor != index;
+                self.section = section;
+                self.cursor = index;
+                return changed;
+            }
+        }
+        false
+    }
+
+    pub fn set_section(&mut self, section: MenuSection, context: MenuContext) -> bool {
+        let Some(index) = Self::first_visible_in_section(section, context) else {
+            return false;
+        };
+        let changed = self.section != section || self.cursor != index;
+        self.section = section;
+        self.cursor = index;
+        changed
+    }
+
+    pub fn section_for_header_row(row: u16) -> Option<MenuSection> {
+        match row {
+            1 => Some(MenuSection::Mount),
+            5 => Some(MenuSection::View),
+            12 => Some(MenuSection::Action),
+            _ => None,
         }
     }
 
-    pub fn index_for_hotkey(key: char) -> Option<usize> {
+    pub fn index_for_hotkey(&self, key: char, context: MenuContext) -> Option<usize> {
+        let local = key.to_digit(10)? as usize;
         MENU_ENTRIES
             .iter()
-            .position(|entry| entry.hotkey == Some(key))
+            .enumerate()
+            .filter(|(index, entry)| {
+                entry.section == self.section && Self::is_visible(*index, context)
+            })
+            .nth(local)
+            .map(|(index, _)| index)
     }
 
     pub fn index_for_command(command: MenuCommand) -> Option<usize> {
         MENU_ENTRIES.iter().position(|entry| entry.command == command)
     }
 
-    pub fn row_for_index(index: usize) -> u16 {
-        match index {
-            0 => 2,
-            1 => 3,
-            2 => 6,
-            3 => 7,
-            4 => 8,
-            5 => 11,
-            6 => 12,
-            7 => 13,
-            8 => 14,
-            9 => 15,
-            10 => 16,
-            _ => u16::MAX,
+    pub fn is_visible(index: usize, context: MenuContext) -> bool {
+        let Some(entry) = MENU_ENTRIES.get(index) else {
+            return false;
+        };
+        match entry.command {
+            MenuCommand::Reload
+            | MenuCommand::Parent
+            | MenuCommand::TreeLayout
+            | MenuCommand::RadialLayout
+            | MenuCommand::Spacing
+            | MenuCommand::Depth
+            | MenuCommand::Center
+            | MenuCommand::Exit => true,
+            MenuCommand::Enter => context == MenuContext::Folder,
+            MenuCommand::Sha256 | MenuCommand::Zip | MenuCommand::Rename => {
+                context == MenuContext::File
+            }
+            MenuCommand::NewFolder => matches!(context, MenuContext::None | MenuContext::Folder),
+            MenuCommand::Delete => matches!(context, MenuContext::File | MenuContext::Folder),
         }
     }
 
-    pub fn index_for_row(row: u16) -> Option<usize> {
-        (0..MENU_ENTRIES.len()).find(|&index| Self::row_for_index(index) == row)
+    pub fn row_for_index(index: usize, context: MenuContext) -> Option<u16> {
+        let entry = MENU_ENTRIES.get(index)?;
+        if !Self::is_visible(index, context) {
+            return None;
+        }
+        let start = match entry.section {
+            MenuSection::Mount => 2,
+            MenuSection::View => 6,
+            MenuSection::Action => 13,
+        };
+        let offset = MENU_ENTRIES[..index]
+            .iter()
+            .enumerate()
+            .filter(|(prior, candidate)| {
+                candidate.section == entry.section && Self::is_visible(*prior, context)
+            })
+            .count() as u16;
+        Some(start + offset)
+    }
+
+    pub fn index_for_row(row: u16, context: MenuContext) -> Option<usize> {
+        (0..MENU_ENTRIES.len()).find(|&index| Self::row_for_index(index, context) == Some(row))
+    }
+
+    pub fn local_index(index: usize, context: MenuContext) -> Option<usize> {
+        let entry = MENU_ENTRIES.get(index)?;
+        if !Self::is_visible(index, context) {
+            return None;
+        }
+        Some(
+            MENU_ENTRIES[..index]
+                .iter()
+                .enumerate()
+                .filter(|(prior, candidate)| {
+                    candidate.section == entry.section && Self::is_visible(*prior, context)
+                })
+                .count(),
+        )
+    }
+
+    fn first_visible_in_section(section: MenuSection, context: MenuContext) -> Option<usize> {
+        MENU_ENTRIES
+            .iter()
+            .enumerate()
+            .find(|(index, entry)| entry.section == section && Self::is_visible(*index, context))
+            .map(|(index, _)| index)
+    }
+
+    fn action_last_row(context: MenuContext) -> u16 {
+        (0..MENU_ENTRIES.len())
+            .filter_map(|index| {
+                let entry = MENU_ENTRIES[index];
+                if entry.section == MenuSection::Action {
+                    Self::row_for_index(index, context)
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(12)
     }
 }
 
@@ -102,40 +289,83 @@ impl MenuState {
 pub enum PendingAction {
     Move { source: usize, target: usize },
     Trash { source: usize },
+    NewFolder { parent: usize },
+    Rename { source: usize },
 }
 
 #[derive(Clone, Debug)]
-pub struct Confirmation {
+pub enum ModalMode {
+    Confirm,
+    Input {
+        value: String,
+        accept_label: &'static str,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct Modal {
     pub pending: PendingAction,
     pub title: String,
     pub lines: Vec<String>,
+    pub mode: ModalMode,
     pub trash_origin_y: Option<u16>,
 }
 
-impl Confirmation {
+impl Modal {
     pub fn move_node(graph: &GraphView, source: usize, target: usize) -> Self {
-        let source_name = graph.label(source);
-        let target_name = graph.label(target);
         Self {
             pending: PendingAction::Move { source, target },
-            title: "Confirm move".to_string(),
+            title: "Confirm".to_string(),
             lines: vec![
-                format!("Move {source_name}"),
-                format!("into {target_name} ?"),
+                format!("Move {}", graph.label(source)),
+                format!("into {} ?", graph.label(target)),
             ],
+            mode: ModalMode::Confirm,
             trash_origin_y: None,
         }
     }
 
     pub fn trash_node(graph: &GraphView, source: usize) -> Self {
-        let source_name = graph.label(source);
         Self {
             pending: PendingAction::Trash { source },
-            title: "Confirm trash".to_string(),
+            title: "Confirm".to_string(),
             lines: vec![
-                format!("Move {source_name} to recycle area?"),
+                format!("Move {} to recycle area?", graph.label(source)),
                 "Stored in .explorer-trash/".to_string(),
             ],
+            mode: ModalMode::Confirm,
+            trash_origin_y: None,
+        }
+    }
+
+    pub fn new_folder(graph: &GraphView, parent: usize) -> Self {
+        let parent_name = if parent == 0 {
+            graph.root_label()
+        } else {
+            graph.label(parent)
+        };
+        Self {
+            pending: PendingAction::NewFolder { parent },
+            title: "New folder".to_string(),
+            lines: vec![format!("Parent: {parent_name}"), "Folder name:".to_string()],
+            mode: ModalMode::Input {
+                value: "New Folder".to_string(),
+                accept_label: "create",
+            },
+            trash_origin_y: None,
+        }
+    }
+
+    pub fn rename(graph: &GraphView, source: usize) -> Self {
+        let current = graph.node(source).map(|n| n.name.clone()).unwrap_or_default();
+        Self {
+            pending: PendingAction::Rename { source },
+            title: "Name".to_string(),
+            lines: vec![format!("Current: {current}"), "New name:".to_string()],
+            mode: ModalMode::Input {
+                value: current,
+                accept_label: "rename",
+            },
             trash_origin_y: None,
         }
     }
@@ -144,11 +374,43 @@ impl Confirmation {
         self.trash_origin_y = Some(y);
         self
     }
+
+    pub fn is_input(&self) -> bool {
+        matches!(self.mode, ModalMode::Input { .. })
+    }
+
+    pub fn input_value(&self) -> Option<&str> {
+        match &self.mode {
+            ModalMode::Input { value, .. } => Some(value.as_str()),
+            ModalMode::Confirm => None,
+        }
+    }
+
+    pub fn push_char(&mut self, ch: char) -> bool {
+        let ModalMode::Input { value, .. } = &mut self.mode else {
+            return false;
+        };
+        if ch.is_control() || ch == '/' || ch == '\\' {
+            return false;
+        }
+        if value.chars().count() >= 96 {
+            return false;
+        }
+        value.push(ch);
+        true
+    }
+
+    pub fn backspace(&mut self) -> bool {
+        let ModalMode::Input { value, .. } = &mut self.mode else {
+            return false;
+        };
+        value.pop().is_some()
+    }
 }
 
 pub enum Dispatch {
     Exit,
-    Confirm(Confirmation),
+    Modal(Modal),
     Status(String),
 }
 
@@ -175,42 +437,59 @@ pub fn dispatch_menu(
             }
         }
         MenuCommand::TreeLayout => {
-            graph.center();
+            graph.set_layout_mode(LayoutMode::Tree);
             Ok(Dispatch::Status("VIEW · tree layout".to_string()))
+        }
+        MenuCommand::RadialLayout => {
+            graph.set_layout_mode(LayoutMode::Radial);
+            Ok(Dispatch::Status("VIEW · radial layout".to_string()))
         }
         MenuCommand::Spacing => {
             let gap = graph.cycle_spacing();
-            Ok(Dispatch::Status(format!("VIEW · spacing {gap} columns")))
+            Ok(Dispatch::Status(format!("VIEW · spacing {gap}")))
+        }
+        MenuCommand::Depth => {
+            let depth = graph.cycle_depth()?;
+            Ok(Dispatch::Status(format!("VIEW · depth {depth}")))
         }
         MenuCommand::Center => {
             graph.center();
             Ok(Dispatch::Status("VIEW · centered".to_string()))
         }
+        MenuCommand::Enter => match selected {
+            Some(source) if graph.node(source).map(|n| n.is_dir).unwrap_or(false) => {
+                graph.mount_node(source)?;
+                Ok(Dispatch::Status(format!("MOUNT · {}", graph.root_label())))
+            }
+            _ => Ok(Dispatch::Status("ENTER · select a folder first".to_string())),
+        },
         MenuCommand::Sha256 => Ok(Dispatch::Status(
             "ACTION · sha256 callback reserved (std + crossterm only)".to_string(),
         )),
         MenuCommand::Zip => Ok(Dispatch::Status(
             "ACTION · zip callback reserved (std + crossterm only)".to_string(),
         )),
-        MenuCommand::Rename => Ok(Dispatch::Status(
-            "ACTION · rename callback reserved for text-input modal".to_string(),
-        )),
-        MenuCommand::NewFolder => Ok(Dispatch::Status(
-            "ACTION · new-folder callback reserved for text-input modal".to_string(),
-        )),
+        MenuCommand::Rename => match selected {
+            Some(source) => Ok(Dispatch::Modal(Modal::rename(graph, source))),
+            None => Ok(Dispatch::Status("NAME · select a file first".to_string())),
+        },
+        MenuCommand::NewFolder => {
+            let parent = selected
+                .filter(|id| graph.node(*id).map(|n| n.is_dir).unwrap_or(false))
+                .unwrap_or(0);
+            Ok(Dispatch::Modal(Modal::new_folder(graph, parent)))
+        }
         MenuCommand::Delete => match selected {
             None => Ok(Dispatch::Status("DELETE · select one file/folder first".to_string())),
-            Some(source) => Ok(Dispatch::Confirm(Confirmation::trash_node(graph, source))),
+            Some(source) => Ok(Dispatch::Modal(Modal::trash_node(graph, source))),
         },
         MenuCommand::Exit => Ok(Dispatch::Exit),
     }
 }
 
-pub fn execute_confirmation(
-    confirmation: Confirmation,
-    graph: &mut GraphView,
-) -> io::Result<ActionOutcome> {
-    match confirmation.pending {
+pub fn execute_modal(modal: Modal, graph: &mut GraphView) -> io::Result<ActionOutcome> {
+    let pending = modal.pending.clone();
+    match pending {
         PendingAction::Move { source, target } => {
             let status = graph.move_node(source, target)?;
             Ok(ActionOutcome { status, trashed_label: None })
@@ -219,6 +498,16 @@ pub fn execute_confirmation(
             let label = graph.label(source);
             let status = graph.trash_node(source)?;
             Ok(ActionOutcome { status, trashed_label: Some(label) })
+        }
+        PendingAction::NewFolder { parent } => {
+            let name = modal.input_value().unwrap_or("").trim().to_string();
+            let status = graph.create_folder(parent, &name)?;
+            Ok(ActionOutcome { status, trashed_label: None })
+        }
+        PendingAction::Rename { source } => {
+            let name = modal.input_value().unwrap_or("").trim().to_string();
+            let status = graph.rename_node(source, &name)?;
+            Ok(ActionOutcome { status, trashed_label: None })
         }
     }
 }
@@ -236,7 +525,7 @@ struct ModalGeometry {
     button_y: u16,
 }
 
-pub fn confirmation_click(viewport: Viewport, x: u16, y: u16) -> Option<bool> {
+pub fn modal_click(viewport: Viewport, x: u16, y: u16) -> Option<bool> {
     let g = modal_geometry(viewport);
     if y != g.button_y {
         return None;
@@ -251,172 +540,247 @@ pub fn confirmation_click(viewport: Viewport, x: u16, y: u16) -> Option<bool> {
 }
 
 pub fn draw_menu(
-    out: &mut Stdout,
+    frame: &mut Frame,
     menu_x: u16,
     bottom: u16,
     menu: MenuState,
     menu_width: u16,
-) -> io::Result<()> {
+    context: MenuContext,
+    links: &[MenuLink],
+    depth_limit: usize,
+) {
     let right = menu_x + menu_width - 1;
 
-    print_at(out, menu_x, 0, "┯")?;
+    print_at(frame, menu_x, 0, "┯", Style::default());
     for cx in menu_x + 1..right {
-        print_at(out, cx, 0, "─")?;
+        print_at(frame, cx, 0, "─", Style::default());
     }
-    print_at(out, right, 0, "╮")?;
-    print_at(out, menu_x + 3, 0, "╼ Menu ╾")?;
+    print_at(frame, right, 0, "╮", Style::default());
+    print_at(frame, menu_x + 3, 0, "╼ Menu ╾", Style::default());
 
     for y in 1..bottom {
-        print_at(out, menu_x, y, "│")?;
-        print_at(out, right, y, "│")?;
+        print_at(frame, menu_x, y, "│", Style::default());
+        print_at(frame, right, y, "│", Style::default());
     }
-    print_at(out, menu_x, bottom, "╰")?;
+    print_at(frame, menu_x, bottom, "╰", Style::default());
     for cx in menu_x + 1..right {
-        print_at(out, cx, bottom, "─")?;
+        print_at(frame, cx, bottom, "─", Style::default());
     }
-    print_at(out, right, bottom, "╯")?;
+    print_at(frame, right, bottom, "╯", Style::default());
 
-    menu_text(out, menu_x + 2, 1, "mount")?;
-    menu_text(out, menu_x + 2, 5, "view")?;
-    menu_text(out, menu_x + 2, 10, "actions")?;
+    menu_text(frame, menu_x + 2, 1, "Mount");
+    menu_text(frame, menu_x + 2, 5, "View");
+    menu_text(frame, menu_x + 2, 12, "Action");
 
     for index in 0..MENU_ENTRIES.len() {
-        draw_menu_entry(out, menu_x, bottom, menu, menu_width, index)?;
+        if MenuState::is_visible(index, context) {
+            draw_menu_entry(frame, menu_x, bottom, menu, menu_width, index, context, depth_limit);
+        }
     }
-
-    Ok(())
-}
-
-pub fn draw_menu_cursor_only(
-    out: &mut Stdout,
-    menu_x: u16,
-    bottom: u16,
-    menu: MenuState,
-    menu_width: u16,
-    previous: usize,
-) -> io::Result<()> {
-    draw_menu_entry(out, menu_x, bottom, menu, menu_width, previous)?;
-    if menu.cursor != previous {
-        draw_menu_entry(out, menu_x, bottom, menu, menu_width, menu.cursor)?;
-    }
-    Ok(())
+    draw_links(frame, menu_x, bottom, menu_width, context, links);
 }
 
 fn draw_menu_entry(
-    out: &mut Stdout,
+    frame: &mut Frame,
     menu_x: u16,
     bottom: u16,
     menu: MenuState,
     menu_width: u16,
     index: usize,
-) -> io::Result<()> {
+    context: MenuContext,
+    depth_limit: usize,
+) {
     let Some(entry) = MENU_ENTRIES.get(index) else {
-        return Ok(());
+        return;
     };
-    let y = MenuState::row_for_index(index);
+    let Some(y) = MenuState::row_for_index(index, context) else {
+        return;
+    };
     if y >= bottom {
-        return Ok(());
+        return;
     }
 
+    let local = MenuState::local_index(index, context).unwrap_or(0).min(9);
     let cursor = if menu.cursor == index { "☩" } else { " " };
-    let body = format!("{} {} {}", entry.glyph, cursor, entry.label);
+    let label = if entry.command == MenuCommand::Depth {
+        format!("depth {depth_limit}")
+    } else {
+        entry.label.to_string()
+    };
+    let body = format!("{local} {cursor} {label}");
     let inner_width = menu_width.saturating_sub(4) as usize;
     let line = format!("{:<width$}", clip_text(&body, inner_width), width = inner_width);
-    menu_text(out, menu_x + 2, y, &line)
+    menu_text(frame, menu_x + 2, y, &line);
 }
 
-pub fn draw_confirmation(
-    out: &mut Stdout,
-    confirm: &Confirmation,
-    viewport: Viewport,
-) -> io::Result<()> {
+fn link_geometry(bottom: u16, context: MenuContext, link_count: usize) -> Option<(u16, usize, usize)> {
+    if link_count == 0 {
+        return None;
+    }
+    let action_last = MenuState::action_last_row(context);
+    let minimum_header = action_last.saturating_add(2);
+    if bottom <= minimum_header.saturating_add(1) {
+        return None;
+    }
+    let capacity = (bottom - minimum_header - 1) as usize;
+    let visible = link_count.min(capacity);
+    if visible == 0 {
+        return None;
+    }
+    let first_index = link_count - visible;
+    let first_row = bottom - visible as u16;
+    let header_row = first_row - 1;
+    Some((header_row, first_index, visible))
+}
+
+fn draw_links(
+    frame: &mut Frame,
+    menu_x: u16,
+    bottom: u16,
+    menu_width: u16,
+    context: MenuContext,
+    links: &[MenuLink],
+) {
+    let Some((header_row, first_index, visible)) = link_geometry(bottom, context, links.len()) else {
+        return;
+    };
+    menu_text(frame, menu_x + 2, header_row, "Links");
+    let inner_width = menu_width.saturating_sub(4) as usize;
+    for offset in 0..visible {
+        let link = &links[first_index + offset];
+        let line = format!(
+            "{:<width$}",
+            clip_text(&link.label(), inner_width),
+            width = inner_width
+        );
+        menu_text(frame, menu_x + 2, header_row + 1 + offset as u16, &line);
+    }
+}
+
+pub fn link_index_for_row(
+    row: u16,
+    bottom: u16,
+    context: MenuContext,
+    link_count: usize,
+) -> Option<usize> {
+    let (header_row, first_index, visible) = link_geometry(bottom, context, link_count)?;
+    let first_row = header_row + 1;
+    if row < first_row || row >= first_row + visible as u16 {
+        return None;
+    }
+    Some(first_index + (row - first_row) as usize)
+}
+
+pub fn draw_modal(frame: &mut Frame, modal: &Modal, viewport: Viewport) {
     let g = modal_geometry(viewport);
     let inner = g.width.saturating_sub(2) as usize;
+    let modal_style = Style::new(Color::Black, Color::Grey);
+    let button_style = Style::new(Color::Black, Color::White);
 
-    queue!(
-        out,
-        SetBackgroundColor(Color::Grey),
-        SetForegroundColor(Color::Black)
-    )?;
-    for row in 0..g.height {
-        print_at(out, g.x, g.y + row, &" ".repeat(g.width as usize))?;
+    frame.fill_rect(g.x, g.y, g.width, g.height, ' ', modal_style);
+
+    let title = clip_text(&modal.title, inner.saturating_sub(10));
+    let notch = format!("╗ {title} ╔");
+    let top_fill = inner.saturating_sub(notch.chars().count());
+    let left_fill = top_fill / 2;
+    let right_fill = top_fill - left_fill;
+    let top = format!("╒{}{}{}╕", "═".repeat(left_fill), notch, "═".repeat(right_fill));
+    print_at(frame, g.x, g.y, &fit_exact(&top, g.width as usize), modal_style);
+
+    let notch_width = notch.chars().count().saturating_sub(2).max(4);
+    let cap = format!("╚{}╝", "═".repeat(notch_width.saturating_sub(2)));
+    let cap_space = inner.saturating_sub(cap.chars().count());
+    let cap_left = cap_space / 2;
+    let cap_right = cap_space - cap_left;
+    let second = format!("│{}{}{}│", " ".repeat(cap_left), cap, " ".repeat(cap_right));
+    print_at(frame, g.x, g.y + 1, &fit_exact(&second, g.width as usize), modal_style);
+
+    let mut content = vec![String::new(), String::new(), String::new()];
+    for (i, line) in modal.lines.iter().take(3).enumerate() {
+        content[i] = line.clone();
+    }
+    if let ModalMode::Input { value, .. } = &modal.mode {
+        content[2] = format!("> {value}▏");
+    }
+    for (i, line) in content.iter().enumerate() {
+        let clipped = clip_text_tail(line, inner.saturating_sub(2));
+        let body = format!(" {:<width$} ", clipped, width = inner.saturating_sub(2));
+        print_at(
+            frame,
+            g.x,
+            g.y + 2 + i as u16,
+            &fit_exact(&format!("│{body}│"), g.width as usize),
+            modal_style,
+        );
     }
 
-    print_at(out, g.x, g.y, "╒")?;
-    print_at(out, g.x + 1, g.y, &"═".repeat(inner))?;
-    print_at(out, g.x + g.width - 1, g.y, "╕")?;
+    let left_half = (inner - 1) / 2;
+    let right_half = inner - 1 - left_half;
+    let divider = format!("├{}┬{}┤", "╌".repeat(left_half), "╌".repeat(right_half));
+    print_at(frame, g.x, g.y + 5, &fit_exact(&divider, g.width as usize), modal_style);
 
-    let title = clip_text(&confirm.title, inner.saturating_sub(4));
-    let title_x = g.x + 1 + (inner.saturating_sub(title.chars().count()) / 2) as u16;
-    print_at(out, title_x, g.y, &title)?;
+    let (yes_label, no_label) = match &modal.mode {
+        ModalMode::Confirm => ("⫸ yes (Y)".to_string(), "⫸ no (N)".to_string()),
+        ModalMode::Input { accept_label, .. } => {
+            (format!("⫸ {accept_label}"), "⫸ cancel (esc)".to_string())
+        }
+    };
+    let buttons = format!(
+        "╞{}╪{}╡",
+        fill_center(left_half, &yes_label, '═'),
+        fill_center(right_half, &no_label, '═')
+    );
+    print_at(frame, g.x, g.button_y, &fit_exact(&buttons, g.width as usize), button_style);
 
-    for row in 1..g.height - 1 {
-        print_at(out, g.x, g.y + row, "│")?;
-        print_at(out, g.x + g.width - 1, g.y + row, "│")?;
-    }
-
-    for (i, line) in confirm.lines.iter().take(3).enumerate() {
-        let clipped = clip_text(line, inner.saturating_sub(2));
-        print_at(out, g.x + 2, g.y + 2 + i as u16, &clipped)?;
-    }
-
-    queue!(
-        out,
-        SetBackgroundColor(Color::White),
-        SetForegroundColor(Color::Black)
-    )?;
-    let yes_width = (g.yes_x1 - g.yes_x0 + 1) as usize;
-    let no_width = (g.no_x1 - g.no_x0 + 1) as usize;
-    print_at(
-        out,
-        g.yes_x0,
-        g.button_y,
-        &format!("{:^width$}", "⫸ yes (Y)", width = yes_width),
-    )?;
-    print_at(
-        out,
-        g.no_x0,
-        g.button_y,
-        &format!("{:^width$}", "⫸ no (N)", width = no_width),
-    )?;
-
-    queue!(
-        out,
-        SetBackgroundColor(Color::Grey),
-        SetForegroundColor(Color::Black)
-    )?;
-    print_at(out, g.x, g.y + g.height - 1, "╘")?;
-    print_at(out, g.x + 1, g.y + g.height - 1, &"═".repeat(inner))?;
-    print_at(out, g.x + g.width - 1, g.y + g.height - 1, "╛")?;
-    queue!(out, ResetColor)?;
-    Ok(())
+    let bottom = format!("╘{}╧{}╛", "═".repeat(left_half), "═".repeat(right_half));
+    print_at(frame, g.x, g.y + 7, &fit_exact(&bottom, g.width as usize), modal_style);
 }
 
 fn modal_geometry(viewport: Viewport) -> ModalGeometry {
-    let width = viewport.width.saturating_sub(4).min(44).max(24);
+    let width = viewport.width.saturating_sub(4).min(46).max(24);
     let height = 8;
     let x = viewport.x + viewport.width.saturating_sub(width) / 2;
     let y = viewport.y + viewport.height.saturating_sub(height) / 2;
     let inner = width.saturating_sub(2);
-    let half = inner / 2;
+    let left_half = (inner - 1) / 2;
     ModalGeometry {
         x,
         y,
         width,
         height,
         yes_x0: x + 1,
-        yes_x1: x + half,
-        no_x0: x + half + 1,
+        yes_x1: x + left_half,
+        no_x0: x + left_half + 2,
         no_x1: x + width - 2,
-        button_y: y + height - 2,
+        button_y: y + 6,
     }
 }
 
-fn menu_text(out: &mut Stdout, x: u16, y: u16, text: &str) -> io::Result<()> {
-    // The cursor glyph is the sole hover/selection indicator. No menu color
-    // changes are needed, which keeps cursor-only redraws very small.
-    queue!(out, ResetColor)?;
-    print_at(out, x, y, text)
+fn fill_center(width: usize, label: &str, fill: char) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let visible = clip_text(label, width);
+    let used = visible.chars().count();
+    let pad = width.saturating_sub(used);
+    let left = pad / 2;
+    let right = pad - left;
+    format!("{}{}{}", fill.to_string().repeat(left), visible, fill.to_string().repeat(right))
+}
+
+fn fit_exact(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count == width {
+        return text.to_string();
+    }
+    if count > width {
+        return text.chars().take(width).collect();
+    }
+    format!("{}{}", text, " ".repeat(width - count))
+}
+
+fn menu_text(frame: &mut Frame, x: u16, y: u16, text: &str) {
+    print_at(frame, x, y, text, Style::default());
 }
 
 fn clip_text(text: &str, max: usize) -> String {
@@ -435,6 +799,28 @@ fn clip_text(text: &str, max: usize) -> String {
     clipped
 }
 
-fn print_at(out: &mut Stdout, x: u16, y: u16, text: &str) -> io::Result<()> {
-    queue!(out, MoveTo(x, y), Print(text))
+fn clip_text_tail(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(max - 1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{tail}")
+}
+
+fn print_at(frame: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
+    frame.put_str(x, y, text, style);
 }

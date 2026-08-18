@@ -92,8 +92,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "explorer_layout"
-version = "0.1.0"
+name = "explorer_tui_v14"
+version = "0.14.0"
 dependencies = [
  "crossterm",
 ]
