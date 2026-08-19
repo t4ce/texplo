@@ -368,7 +368,26 @@ fn run_terminal_session(
                 // events often arrive in clusters; this renders the newest camera
                 // position once instead of every intermediate position.
                 for batch_index in 0..MAX_EVENT_BATCH {
-                    handle_event(app, event::read()?)?;
+                    let terminal_event = event::read()?;
+                    #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+                    match &terminal_event {
+                        Event::Key(_) => {
+                            let _ = trueos::logl::log_record(
+                                trueos::logl::level::INFO,
+                                "texplo-startup-probe",
+                                "crossterm-input event=key",
+                            );
+                        }
+                        Event::Mouse(_) => {
+                            let _ = trueos::logl::log_record(
+                                trueos::logl::level::INFO,
+                                "texplo-startup-probe",
+                                "crossterm-input event=mouse",
+                            );
+                        }
+                        _ => {}
+                    }
+                    handle_event(app, terminal_event)?;
                     if app.should_exit || batch_index + 1 == MAX_EVENT_BATCH {
                         break;
                     }
@@ -398,12 +417,21 @@ fn terminal_lease_io(error: trueos::vshell::TerminalLeaseError) -> io::Error {
 
 #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
 fn trueos_main() -> io::Result<()> {
-    // Initialization remains outside terminal ownership. If filesystem/service
-    // setup fails, Shell2 is still the owner and there is no terminal lease to
-    // recover.
-    let config = Config::from_args();
-    let mut app = App::new(config)?;
+    // Bare-metal input requires the terminal lease to establish the terminal
+    // route before the full application performs its VFS-backed initialization.
+    // Keep the claim rollback explicit so an initialization error still returns
+    // ownership to Shell2 deterministically.
     let mut lease = trueos::vshell::terminal_initial_lease().map_err(terminal_lease_io)?;
+    let config = Config::from_args();
+    let mut app = match App::new(config) {
+        Ok(app) => app,
+        Err(error) => {
+            let reason = format!("texplo initialization failed after terminal claim: {error}");
+            let _ = trueos::vshell::report_exit_reason(reason.as_str());
+            let _ = lease.release_to_shell();
+            return Err(error);
+        }
+    };
 
     loop {
         if let Err(error) = run_terminal_session(&mut app, || {
@@ -447,7 +475,19 @@ fn main() -> io::Result<()> {
 
 fn handle_event(app: &mut App, event: Event) -> io::Result<()> {
     match event {
-        Event::Resize(_, _) => app.schedule_resize(),
+        Event::Resize(columns, rows) => {
+            #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+            if rows <= 12 {
+                let _ = trueos::logl::log_record(
+                    trueos::logl::level::INFO,
+                    "texplo-startup-probe",
+                    format_args!("resize-rescue park cols={columns} rows={rows}"),
+                );
+                app.should_exit = true;
+                return Ok(());
+            }
+            app.schedule_resize();
+        }
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             handle_key(app, key.code, key.modifiers)?
         }
@@ -1086,6 +1126,13 @@ fn confirm_modal(app: &mut App, yes: bool) -> io::Result<()> {
 }
 
 fn update_animation(app: &mut App, now: Instant) {
+    // Do not query terminal geometry on every idle event-loop turn. On TrueOS
+    // terminal::size() is a real platform boundary; only the falling-trash
+    // animation needs a fresh layout while it is active.
+    if app.falling.is_none() {
+        return;
+    }
+
     let stop_y = Layout::current(app.diagnostics)
         .ok()
         .flatten()
