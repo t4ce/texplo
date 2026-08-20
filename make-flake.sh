@@ -105,8 +105,22 @@ copy_flake_files() {
     cp ./Cargo.lock ./Cargo.toml ./default.nix ./flake.lock ./flake.nix ./flake/ 2>/dev/null
 }
 
+restore_original_files() {
+    local rev
+    rev=$(get_rev)
+    echo "restoring files to their state at ${rev}"
+    git restore --source "$rev" -- \
+        ./Cargo.lock \
+        ./Cargo.toml \
+        ./default.nix \
+        ./flake.lock \
+        ./flake.nix
+}
+
 update_src_hash
 update_cargo_hash
 copy_flake_files
 
 echo "done."
+
+restore_original_files
