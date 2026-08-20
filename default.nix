@@ -15,14 +15,13 @@
 rustPlatform.buildRustPackage rec {
   pname = "texplo";
   version = "X";
-  # version = "487a6f3d2694f271615c81acd92a5902e0e40223"; # git rev-parse HEAD
   # Points to the source code folder
   src = ./.;
 #   src = fetchFromGitHub {
-#     owner = "t4ce";
+#     owner = "GlassGhost";
 #     repo = pname;
 #     rev = version;
-#     sha256 = "sha256-9bCx4AHa8q5Wpb+9geDFMG/cYKluDxKtcd2FrEBNhYM=";
+#     sha256 = "somehash";
 #   };
 
   # buildRustPackage requires one of:
@@ -41,6 +40,6 @@ rustPlatform.buildRustPackage rec {
     license = lib.licenses.bsd2;
     platforms = lib.platforms.unix;
     maintainers = [ lib.maintainers.GlassGhost ];
-
+    mainProgram = "explorer_tui_v14";
   };
 }

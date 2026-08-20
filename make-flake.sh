@@ -22,6 +22,10 @@ update_hash_attr() {
   echo "updated ${attr} = ${hash}"
 }
 
+get_rev() {
+  git rev-parse HEAD
+}
+
 update_src_hash() {
   local pname version owner repo rev
   pname=$(get_attr pname)
@@ -39,11 +43,12 @@ update_src_hash() {
     exit 1
   fi
 
-  local url="https://github.com/${owner}/${repo}/archive/${rev}.tar.gz"
-  echo "fetching: $url"
-
-  local hash
-  hash=$(nix store prefetch-file --unpack --json "$url" | sed -n 's/.*"hash":"\([^"]*\)".*/\1/p')
+  local tmp hash
+  tmp=$(mktemp -d)
+  echo "archiving: ${owner}/${repo} @ ${rev} (local, offline)"
+  git archive "$rev" | tar -x -C "$tmp"
+  hash=$(nix hash path "$tmp" --type sha256 --sri)
+  rm -rf "$tmp"
 
   if [ -z "$hash" ]; then
     echo "error: failed to compute src hash" >&2
@@ -60,6 +65,13 @@ update_cargo_hash() {
   local got
   got=$(sed -n 's/.*got:[[:space:]]*\(sha256-[A-Za-z0-9+/=]\+\).*/\1/p' "$LOG" | tail -1)
 
+  if [ -z "$got" ] && grep -q "invalid SRI hash" "$LOG"; then
+    echo "placeholder/invalid cargoHash; resetting to fake hash and rebuilding..."
+    update_hash_attr "cargoHash" "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    nix build --no-link 2>&1 | tee "$LOG" >/dev/null || true
+    got=$(sed -n 's/.*got:[[:space:]]*\(sha256-[A-Za-z0-9+/=]\+\).*/\1/p' "$LOG" | tail -1)
+  fi
+
   if [ -z "$got" ]; then
     if grep -q "error:" "$LOG"; then
       echo "note: build failed for a non-hash reason (cargoHash is fine):"
@@ -75,7 +87,26 @@ update_cargo_hash() {
   nix build --no-link 2>&1 | tail -20 || true
 }
 
+REV="$(get_rev)"
+echo "updating version to ${REV}"
+update_hash_attr "version" "$REV"
+
+echo "commenting src = ./.;"
+sed -i 's|^[[:space:]]*src[[:space:]]*=[[:space:]]*\./\.;|#   src = ./.;|' "$NIX_FILE"
+
+echo "uncommenting src = fetchFromGitHub { ... }"
+sed -i '/^#   src = fetchFromGitHub {/,/^#   };/s/^#   /  /' "$NIX_FILE"
+
+copy_flake_files() {
+    # Ensure the target directory exists
+    mkdir -p ./flake
+
+    # Copy the specified files if they exist
+    cp ./Cargo.lock ./Cargo.toml ./default.nix ./flake.lock ./flake.nix ./flake/ 2>/dev/null
+}
+
 update_src_hash
 update_cargo_hash
+copy_flake_files
 
 echo "done."
