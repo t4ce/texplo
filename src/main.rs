@@ -10,7 +10,7 @@ use std::{
     collections::VecDeque,
     env,
     io::{self, stdout},
-    path::{Component, Path, PathBuf, MAIN_SEPARATOR},
+    path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -50,11 +50,13 @@ const MIN_CONTENT_HEIGHT: u16 = 27;
 const TICK: Duration = Duration::from_millis(16);
 const MAX_EVENT_BATCH: usize = 64;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(70);
-const BUILD_ID: &str = "v0.25 · tde root + depth + archive";
+const BUILD_ID: &str = "v0.26 · pinned tde + middle-dot paths";
 const FALL_TICK: Duration = Duration::from_millis(90);
 const ZOOM_LEVELS: [u16; 5] = [75, 100, 125, 150, 200];
 const DEFAULT_ZOOM_STEP: usize = 1;
 const RULE_TITLE_SEPARATOR: &str = "・・";
+const BREADCRUMB_SEPARATOR: &str = "・";
+const BREADCRUMB_ROOT_LABEL: &str = "root";
 
 #[derive(Clone)]
 struct Config {
@@ -160,8 +162,11 @@ fn browse_path_from_script(script: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod launch_script_tests {
-    use super::{browse_path_from_script, launch_directives_from_script};
-    use std::path::PathBuf;
+    use super::{
+        breadcrumb_layout, browse_path_from_script, launch_directives_from_script, text_cell_width,
+        BREADCRUMB_ROOT_LABEL, BREADCRUMB_SEPARATOR,
+    };
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn uses_the_last_nonempty_browse_directive() {
@@ -185,6 +190,25 @@ mod launch_script_tests {
             launch_directives_from_script("fs-scope trueosfs\nbrowse/\ndepth 2\n");
         assert_eq!(directives.browse_path, Some(PathBuf::from("/")));
         assert_eq!(directives.depth, Some(2));
+    }
+
+    #[test]
+    fn breadcrumb_uses_middle_dots_without_legacy_slashes() {
+        let layout = breadcrumb_layout(Path::new("/apps/texplo"), 0, 80).unwrap();
+        let labels: Vec<&str> = layout
+            .crumbs
+            .iter()
+            .map(|crumb| crumb.label.as_str())
+            .collect();
+        assert_eq!(labels, [BREADCRUMB_ROOT_LABEL, "apps", "texplo"]);
+
+        let expected_width = labels
+            .iter()
+            .map(|label| text_cell_width(label))
+            .sum::<usize>()
+            + 2 * text_cell_width(BREADCRUMB_SEPARATOR);
+        assert_eq!(layout.content_width as usize, expected_width);
+        assert!(!labels.iter().any(|label| label.contains('/')));
     }
 }
 
@@ -1566,13 +1590,17 @@ fn breadcrumb_layout(path: &Path, start_x: u16, end_x: u16) -> Option<Breadcrumb
     if raw.is_empty() {
         return None;
     }
-    let separator = MAIN_SEPARATOR.to_string();
+    let breadcrumb_separator_width = text_cell_width(BREADCRUMB_SEPARATOR);
 
     let content_width_for = |from: usize| -> usize {
-        let mut used = if from > 0 { 2 } else { 0 }; // …/
+        let mut used = if from > 0 {
+            text_cell_width("…") + breadcrumb_separator_width
+        } else {
+            0
+        };
         for i in from..raw.len() {
-            if i > from && raw[i - 1].0 != separator {
-                used += 1;
+            if i > from {
+                used += breadcrumb_separator_width;
             }
             used += text_cell_width(&raw[i].0);
         }
@@ -1584,7 +1612,7 @@ fn breadcrumb_layout(path: &Path, start_x: u16, end_x: u16) -> Option<Breadcrumb
         from += 1;
     }
 
-    let prefix = (from > 0).then(|| format!("…{MAIN_SEPARATOR}"));
+    let prefix = (from > 0).then(|| format!("…{BREADCRUMB_SEPARATOR}"));
     let mut labels: Vec<String> = raw[from..].iter().map(|(label, _)| label.clone()).collect();
     let mut content_width = content_width_for(from);
     if content_width > max_content {
@@ -1608,8 +1636,8 @@ fn breadcrumb_layout(path: &Path, start_x: u16, end_x: u16) -> Option<Breadcrumb
 
     let mut crumbs = Vec::new();
     for (local, source_index) in (from..raw.len()).enumerate() {
-        if local > 0 && raw[source_index - 1].0 != separator {
-            cursor = cursor.saturating_add(1);
+        if local > 0 {
+            cursor = cursor.saturating_add(breadcrumb_separator_width as u16);
         }
         let label = labels.get(local).cloned().unwrap_or_default();
         let label_width = text_cell_width(&label) as u16;
@@ -1642,9 +1670,8 @@ fn path_components(path: &Path) -> Vec<(String, PathBuf)> {
                 out.push((prefix.as_os_str().to_string_lossy().into_owned(), current.clone()));
             }
             Component::RootDir => {
-                let root = MAIN_SEPARATOR.to_string();
-                current.push(Path::new(&root));
-                out.push((root, current.clone()));
+                current.push(Path::new("/"));
+                out.push((BREADCRUMB_ROOT_LABEL.to_string(), current.clone()));
             }
             Component::CurDir => {}
             Component::ParentDir => {
@@ -1685,11 +1712,8 @@ fn draw_breadcrumb(frame: &mut Frame, app: &App, layout: &BreadcrumbLayout) {
 
     for (index, crumb) in layout.crumbs.iter().enumerate() {
         if index > 0 {
-            let previous = &layout.crumbs[index - 1];
-            if previous.label != MAIN_SEPARATOR.to_string() {
-                print_at(frame, cursor, 0, &MAIN_SEPARATOR.to_string(), Style::default());
-                cursor += 1;
-            }
+            print_at(frame, cursor, 0, BREADCRUMB_SEPARATOR, Style::default());
+            cursor += text_cell_width(BREADCRUMB_SEPARATOR) as u16;
         }
 
         let mut style = Style::default();

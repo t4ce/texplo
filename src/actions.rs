@@ -1,7 +1,4 @@
-use std::{
-    io,
-    path::PathBuf,
-};
+use std::{io, path::PathBuf};
 
 use crossterm::style::Color;
 
@@ -52,7 +49,10 @@ impl MenuSection {
     const ORDER: [Self; 4] = [Self::Mount, Self::View, Self::Action, Self::Clip];
 
     fn stepped(self, reverse: bool) -> Self {
-        let current = Self::ORDER.iter().position(|section| *section == self).unwrap_or(0);
+        let current = Self::ORDER
+            .iter()
+            .position(|section| *section == self)
+            .unwrap_or(0);
         let next = if reverse {
             (current + Self::ORDER.len() - 1) % Self::ORDER.len()
         } else {
@@ -72,19 +72,71 @@ pub struct MenuEntry {
 // The visual order is the contract from ☰enu_Rework.txt. Local hotkeys are
 // assigned after contextual filtering, so every section reuses 🯰..🯹/0..9.
 pub const MENU_ENTRIES: [MenuEntry; 13] = [
-    MenuEntry { label: "center", command: MenuCommand::Center, section: MenuSection::View },
-    MenuEntry { label: "zoom", command: MenuCommand::Zoom, section: MenuSection::View },
-    MenuEntry { label: "depth", command: MenuCommand::Depth, section: MenuSection::View },
-    MenuEntry { label: "space", command: MenuCommand::Spacing, section: MenuSection::View },
-    MenuEntry { label: "line", command: MenuCommand::LineStyle, section: MenuSection::View },
-    MenuEntry { label: "layout", command: MenuCommand::ToggleLayout, section: MenuSection::View },
-    MenuEntry { label: "enter", command: MenuCommand::Enter, section: MenuSection::Action },
-    MenuEntry { label: "new 🖿", command: MenuCommand::NewFolder, section: MenuSection::Action },
-    MenuEntry { label: "new 🖹", command: MenuCommand::NewFile, section: MenuSection::Action },
-    MenuEntry { label: "del ␡", command: MenuCommand::Delete, section: MenuSection::Action },
-    MenuEntry { label: "sha ＃", command: MenuCommand::Sha256, section: MenuSection::Action },
-    MenuEntry { label: "7z 🗜", command: MenuCommand::Zip, section: MenuSection::Action },
-    MenuEntry { label: "esc ␛", command: MenuCommand::Exit, section: MenuSection::Action },
+    MenuEntry {
+        label: "center",
+        command: MenuCommand::Center,
+        section: MenuSection::View,
+    },
+    MenuEntry {
+        label: "zoom",
+        command: MenuCommand::Zoom,
+        section: MenuSection::View,
+    },
+    MenuEntry {
+        label: "depth",
+        command: MenuCommand::Depth,
+        section: MenuSection::View,
+    },
+    MenuEntry {
+        label: "space",
+        command: MenuCommand::Spacing,
+        section: MenuSection::View,
+    },
+    MenuEntry {
+        label: "line",
+        command: MenuCommand::LineStyle,
+        section: MenuSection::View,
+    },
+    MenuEntry {
+        label: "layout",
+        command: MenuCommand::ToggleLayout,
+        section: MenuSection::View,
+    },
+    MenuEntry {
+        label: "enter",
+        command: MenuCommand::Enter,
+        section: MenuSection::Action,
+    },
+    MenuEntry {
+        label: "new 🖿",
+        command: MenuCommand::NewFolder,
+        section: MenuSection::Action,
+    },
+    MenuEntry {
+        label: "new 🖹",
+        command: MenuCommand::NewFile,
+        section: MenuSection::Action,
+    },
+    MenuEntry {
+        label: "del ␡",
+        command: MenuCommand::Delete,
+        section: MenuSection::Action,
+    },
+    MenuEntry {
+        label: "sha ＃",
+        command: MenuCommand::Sha256,
+        section: MenuSection::Action,
+    },
+    MenuEntry {
+        label: "7z 🗜",
+        command: MenuCommand::Zip,
+        section: MenuSection::Action,
+    },
+    MenuEntry {
+        label: "esc ␛",
+        command: MenuCommand::Exit,
+        section: MenuSection::Action,
+    },
 ];
 
 #[derive(Clone, Debug)]
@@ -179,7 +231,9 @@ impl MenuState {
         if matches!(self.section, MenuSection::Mount | MenuSection::Clip) {
             return false;
         }
-        if Self::is_visible(self.cursor, context) && MENU_ENTRIES[self.cursor].section == self.section {
+        if Self::is_visible(self.cursor, context)
+            && MENU_ENTRIES[self.cursor].section == self.section
+        {
             return false;
         }
 
@@ -284,7 +338,9 @@ impl MenuState {
     }
 
     pub fn index_for_command(command: MenuCommand) -> Option<usize> {
-        MENU_ENTRIES.iter().position(|entry| entry.command == command)
+        MENU_ENTRIES
+            .iter()
+            .position(|entry| entry.command == command)
     }
 
     pub fn is_visible(index: usize, context: MenuContext) -> bool {
@@ -385,7 +441,9 @@ impl MenuState {
         MENU_ENTRIES
             .iter()
             .enumerate()
-            .filter(|(index, entry)| entry.section == MenuSection::Action && Self::is_visible(*index, context))
+            .filter(|(index, entry)| {
+                entry.section == MenuSection::Action && Self::is_visible(*index, context)
+            })
             .count()
     }
 
@@ -417,7 +475,11 @@ impl MenuState {
         if capacity == 0 {
             return 0;
         }
-        let desired = if link_count == 0 { 1 } else { link_count.min(10) };
+        let desired = if link_count == 0 {
+            1
+        } else {
+            link_count.min(10)
+        };
         desired.min(capacity)
     }
 
@@ -544,7 +606,10 @@ impl Modal {
     }
 
     pub fn rename(graph: &GraphView, source: usize) -> Self {
-        let current = graph.node(source).map(|n| n.name.clone()).unwrap_or_default();
+        let current = graph
+            .node(source)
+            .map(|n| n.name.clone())
+            .unwrap_or_default();
         Self {
             pending: PendingAction::Rename { source },
             title: "Name".to_string(),
@@ -621,7 +686,9 @@ pub fn dispatch_menu(
             if graph.mount_parent()? {
                 Ok(Dispatch::Status(format!("MOUNT · {}", graph.root_label())))
             } else {
-                Ok(Dispatch::Status("MOUNT · already at filesystem root".to_string()))
+                Ok(Dispatch::Status(
+                    "MOUNT · already at filesystem root".to_string(),
+                ))
             }
         }
         MenuCommand::TreeLayout => {
@@ -662,7 +729,9 @@ pub fn dispatch_menu(
                 graph.mount_node(source)?;
                 Ok(Dispatch::Status(format!("MOUNT · {}", graph.root_label())))
             }
-            _ => Ok(Dispatch::Status("ENTER · select a folder first".to_string())),
+            _ => Ok(Dispatch::Status(
+                "ENTER · select a folder first".to_string(),
+            )),
         },
         MenuCommand::Sha256 => match selected {
             Some(source) => Ok(Dispatch::Status(match graph.sha256_node(source) {
@@ -699,7 +768,9 @@ pub fn dispatch_menu(
             Ok(Dispatch::Modal(Modal::new_file(graph, parent)))
         }
         MenuCommand::Delete => match selected {
-            None => Ok(Dispatch::Status("DELETE · select one file/folder first".to_string())),
+            None => Ok(Dispatch::Status(
+                "DELETE · select one file/folder first".to_string(),
+            )),
             Some(source) => Ok(Dispatch::Modal(Modal::trash_node(graph, source))),
         },
         MenuCommand::Exit => Ok(Dispatch::Exit),
@@ -711,31 +782,49 @@ pub fn execute_modal(modal: Modal, graph: &mut GraphView) -> io::Result<ActionOu
     match pending {
         PendingAction::Move { source, target } => {
             let status = graph.move_node(source, target)?;
-            Ok(ActionOutcome { status, trashed_label: None })
+            Ok(ActionOutcome {
+                status,
+                trashed_label: None,
+            })
         }
         PendingAction::MoveToPath { source, target } => {
             let status = graph.move_node_to_path(source, &target)?;
-            Ok(ActionOutcome { status, trashed_label: None })
+            Ok(ActionOutcome {
+                status,
+                trashed_label: None,
+            })
         }
         PendingAction::Trash { source } => {
             let label = graph.label(source);
             let status = graph.trash_node(source)?;
-            Ok(ActionOutcome { status, trashed_label: Some(label) })
+            Ok(ActionOutcome {
+                status,
+                trashed_label: Some(label),
+            })
         }
         PendingAction::NewFolder { parent } => {
             let name = modal.input_value().unwrap_or("").trim().to_string();
             let status = graph.create_folder(parent, &name)?;
-            Ok(ActionOutcome { status, trashed_label: None })
+            Ok(ActionOutcome {
+                status,
+                trashed_label: None,
+            })
         }
         PendingAction::NewFile { parent } => {
             let name = modal.input_value().unwrap_or("").trim().to_string();
             let status = graph.create_file(parent, &name)?;
-            Ok(ActionOutcome { status, trashed_label: None })
+            Ok(ActionOutcome {
+                status,
+                trashed_label: None,
+            })
         }
         PendingAction::Rename { source } => {
             let name = modal.input_value().unwrap_or("").trim().to_string();
             let status = graph.rename_node(source, &name)?;
-            Ok(ActionOutcome { status, trashed_label: None })
+            Ok(ActionOutcome {
+                status,
+                trashed_label: None,
+            })
         }
     }
 }
@@ -780,8 +869,19 @@ pub fn draw_modal(frame: &mut Frame, modal: &Modal, viewport: Viewport) {
     let top_fill = inner.saturating_sub(notch.chars().count());
     let left_fill = top_fill / 2;
     let right_fill = top_fill - left_fill;
-    let top = format!("╒{}{}{}╕", "═".repeat(left_fill), notch, "═".repeat(right_fill));
-    print_at(frame, g.x, g.y, &fit_exact(&top, g.width as usize), modal_style);
+    let top = format!(
+        "╒{}{}{}╕",
+        "═".repeat(left_fill),
+        notch,
+        "═".repeat(right_fill)
+    );
+    print_at(
+        frame,
+        g.x,
+        g.y,
+        &fit_exact(&top, g.width as usize),
+        modal_style,
+    );
 
     let notch_width = notch.chars().count().saturating_sub(2).max(4);
     let cap = format!("╚{}╝", "═".repeat(notch_width.saturating_sub(2)));
@@ -789,7 +889,13 @@ pub fn draw_modal(frame: &mut Frame, modal: &Modal, viewport: Viewport) {
     let cap_left = cap_space / 2;
     let cap_right = cap_space - cap_left;
     let second = format!("│{}{}{}│", " ".repeat(cap_left), cap, " ".repeat(cap_right));
-    print_at(frame, g.x, g.y + 1, &fit_exact(&second, g.width as usize), modal_style);
+    print_at(
+        frame,
+        g.x,
+        g.y + 1,
+        &fit_exact(&second, g.width as usize),
+        modal_style,
+    );
 
     let mut content = vec![String::new(), String::new(), String::new()];
     for (i, line) in modal.lines.iter().take(3).enumerate() {
@@ -813,7 +919,13 @@ pub fn draw_modal(frame: &mut Frame, modal: &Modal, viewport: Viewport) {
     let left_half = (inner - 1) / 2;
     let right_half = inner - 1 - left_half;
     let divider = format!("├{}┬{}┤", "╌".repeat(left_half), "╌".repeat(right_half));
-    print_at(frame, g.x, g.y + 5, &fit_exact(&divider, g.width as usize), modal_style);
+    print_at(
+        frame,
+        g.x,
+        g.y + 5,
+        &fit_exact(&divider, g.width as usize),
+        modal_style,
+    );
 
     let (yes_label, no_label) = match &modal.mode {
         ModalMode::Confirm => ("⫸ yes (Y)".to_string(), "⫸ no (N)".to_string()),
@@ -826,10 +938,22 @@ pub fn draw_modal(frame: &mut Frame, modal: &Modal, viewport: Viewport) {
         fill_center(left_half, &yes_label, '═'),
         fill_center(right_half, &no_label, '═')
     );
-    print_at(frame, g.x, g.button_y, &fit_exact(&buttons, g.width as usize), button_style);
+    print_at(
+        frame,
+        g.x,
+        g.button_y,
+        &fit_exact(&buttons, g.width as usize),
+        button_style,
+    );
 
     let bottom = format!("╘{}╧{}╛", "═".repeat(left_half), "═".repeat(right_half));
-    print_at(frame, g.x, g.y + 7, &fit_exact(&bottom, g.width as usize), modal_style);
+    print_at(
+        frame,
+        g.x,
+        g.y + 7,
+        &fit_exact(&bottom, g.width as usize),
+        modal_style,
+    );
 }
 
 fn modal_geometry(viewport: Viewport) -> ModalGeometry {
@@ -861,7 +985,12 @@ fn fill_center(width: usize, label: &str, fill: char) -> String {
     let pad = width.saturating_sub(used);
     let left = pad / 2;
     let right = pad - left;
-    format!("{}{}{}", fill.to_string().repeat(left), visible, fill.to_string().repeat(right))
+    format!(
+        "{}{}{}",
+        fill.to_string().repeat(left),
+        visible,
+        fill.to_string().repeat(right)
+    )
 }
 
 fn fit_exact(text: &str, width: usize) -> String {

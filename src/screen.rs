@@ -3,7 +3,9 @@ use std::io::{self, Stdout, Write};
 use crossterm::{
     cursor::MoveTo,
     queue,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    style::{
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    },
     terminal::{Clear, ClearType},
 };
 
@@ -17,7 +19,12 @@ pub struct Style {
 
 impl Style {
     pub const fn new(fg: Color, bg: Color) -> Self {
-        Self { fg, bg, bold: false, underline: false }
+        Self {
+            fg,
+            bg,
+            bold: false,
+            underline: false,
+        }
     }
 
     pub const fn bold(mut self) -> Self {
@@ -73,7 +80,11 @@ impl Default for Cell {
 
 impl Cell {
     fn wide(ch: char, style: Style) -> Self {
-        Self { ch, style, width: 2 }
+        Self {
+            ch,
+            style,
+            width: 2,
+        }
     }
 
     fn continuation(style: Style) -> Self {
@@ -148,7 +159,11 @@ impl Frame {
         }
         self.erase_occupant(x, y);
         let index = self.index(x, y);
-        self.cells[index] = Cell { ch, style, width: 1 };
+        self.cells[index] = Cell {
+            ch,
+            style,
+            width: 1,
+        };
     }
 
     pub fn put_display_char(&mut self, x: u16, y: u16, ch: char, style: Style) -> u16 {
@@ -199,15 +214,7 @@ impl Frame {
         }
     }
 
-    pub fn fill_rect(
-        &mut self,
-        x: u16,
-        y: u16,
-        width: u16,
-        height: u16,
-        ch: char,
-        style: Style,
-    ) {
+    pub fn fill_rect(&mut self, x: u16, y: u16, width: u16, height: u16, ch: char, style: Style) {
         let right = x.saturating_add(width).min(self.width);
         let bottom = y.saturating_add(height).min(self.height);
         for row in y..bottom {
@@ -352,10 +359,7 @@ impl Renderer {
             let mut text = String::new();
             while x < end {
                 let candidate = frame.cell(x, y);
-                if candidate.style != style
-                    || candidate.is_continuation()
-                    || candidate.is_wide()
-                {
+                if candidate.style != style || candidate.is_continuation() || candidate.is_wide() {
                     break;
                 }
                 text.push(candidate.ch);

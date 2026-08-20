@@ -1,8 +1,10 @@
 use crate::{
-    actions::{MenuCommand, MenuContext, MenuLink, MenuSection, MenuState, MountLink, MENU_ENTRIES},
+    actions::{
+        MENU_ENTRIES, MenuCommand, MenuContext, MenuLink, MenuSection, MenuState, MountLink,
+    },
     graph_view::{LineStyle, SelectionStats},
     layout::LayoutMode,
-    screen::{text_cell_width, Frame, Style},
+    screen::{Frame, Style, text_cell_width},
 };
 
 const DIGIT_GLYPHS: [&str; 10] = ["🯰", "🯱", "🯲", "🯳", "🯴", "🯵", "🯶", "🯷", "🯸", "🯹"];
@@ -48,7 +50,12 @@ pub fn draw_menu(
         } else {
             " "
         };
-        menu_line(frame, menu_x, 3 + index as u16, &entry_line(index, cursor, &label));
+        menu_line(
+            frame,
+            menu_x,
+            3 + index as u16,
+            &entry_line(index, cursor, &label),
+        );
     }
     menu_line(frame, menu_x, 3 + visible_mounts as u16, blank);
     let view_header = MenuState::view_header_row(mount_count);
@@ -65,21 +72,56 @@ pub fn draw_menu(
             Some(toggle_glyph(zoom_step.min(4), 5)),
             Some(('┝', '┥')),
         ),
-        (MenuCommand::Depth, "depth", Some(TOGGLE_GLYPHS[depth_limit.min(7)]), Some(('╭', '╮'))),
-        (MenuCommand::Spacing, "space", Some(spacing_toggle_glyph(spacing_level.min(4))), Some(('┝', '┥'))),
-        (MenuCommand::LineStyle, "line", Some(toggle_glyph(line_style_index(line_style), 4)), Some(('┝', '┥'))),
+        (
+            MenuCommand::Depth,
+            "depth",
+            Some(TOGGLE_GLYPHS[depth_limit.min(7)]),
+            Some(('╭', '╮')),
+        ),
+        (
+            MenuCommand::Spacing,
+            "space",
+            Some(spacing_toggle_glyph(spacing_level.min(4))),
+            Some(('┝', '┥')),
+        ),
+        (
+            MenuCommand::LineStyle,
+            "line",
+            Some(toggle_glyph(line_style_index(line_style), 4)),
+            Some(('┝', '┥')),
+        ),
         (
             MenuCommand::ToggleLayout,
             "layout",
-            Some(toggle_glyph(if layout_mode == LayoutMode::Tree { 0 } else { 1 }, 2)),
+            Some(toggle_glyph(
+                if layout_mode == LayoutMode::Tree {
+                    0
+                } else {
+                    1
+                },
+                2,
+            )),
             Some(('╰', '╯')),
         ),
     ];
     for (local, (command, label, toggle, cap)) in view_rows.iter().enumerate() {
-        let Some(index) = MenuState::index_for_command(*command) else { continue; };
-        let Some(y) = MenuState::row_for_index(index, context, mount_count) else { continue; };
-        let cursor = if menu.section == MenuSection::View && menu.cursor == index { "☩" } else { " " };
-        menu_line(frame, menu_x, y, &view_line(local, cursor, label, *toggle, *cap));
+        let Some(index) = MenuState::index_for_command(*command) else {
+            continue;
+        };
+        let Some(y) = MenuState::row_for_index(index, context, mount_count) else {
+            continue;
+        };
+        let cursor = if menu.section == MenuSection::View && menu.cursor == index {
+            "☩"
+        } else {
+            " "
+        };
+        menu_line(
+            frame,
+            menu_x,
+            y,
+            &view_line(local, cursor, label, *toggle, *cap),
+        );
     }
 
     for index in 0..MENU_ENTRIES.len() {
@@ -87,10 +129,18 @@ pub fn draw_menu(
         if entry.section != MenuSection::Action || !MenuState::is_visible(index, context) {
             continue;
         }
-        let Some(y) = MenuState::row_for_index(index, context, mount_count) else { continue; };
-        if y >= bottom { continue; }
+        let Some(y) = MenuState::row_for_index(index, context, mount_count) else {
+            continue;
+        };
+        if y >= bottom {
+            continue;
+        }
         let local = MenuState::local_index(index, context).unwrap_or(0).min(9);
-        let cursor = if menu.section == MenuSection::Action && menu.cursor == index { "☩" } else { " " };
+        let cursor = if menu.section == MenuSection::Action && menu.cursor == index {
+            "☩"
+        } else {
+            " "
+        };
         menu_line(frame, menu_x, y, &entry_line(local, cursor, entry.label));
     }
 
@@ -99,7 +149,8 @@ pub fn draw_menu(
         menu_line(frame, menu_x, action_blank, blank);
     }
 
-    if let (Some(header), Some(stats)) = (MenuState::stats_header_row(context, mount_count), stats) {
+    if let (Some(header), Some(stats)) = (MenuState::stats_header_row(context, mount_count), stats)
+    {
         if header + 5 < bottom {
             menu_line(frame, menu_x, header, "├─╼ Stats      ╾┤");
             let rows = [
@@ -110,7 +161,12 @@ pub fn draw_menu(
                 ("mode", stats.access.as_str()),
             ];
             for (offset, (key, value)) in rows.iter().enumerate() {
-                menu_line(frame, menu_x, header + 1 + offset as u16, &stats_line(key, value));
+                menu_line(
+                    frame,
+                    menu_x,
+                    header + 1 + offset as u16,
+                    &stats_line(key, value),
+                );
             }
             if header + 6 < bottom {
                 menu_line(frame, menu_x, header + 6, blank);
@@ -118,7 +174,8 @@ pub fn draw_menu(
         }
     }
 
-    if let Some(clip_header) = MenuState::clip_header_row(bottom, context, mount_count, links.len()) {
+    if let Some(clip_header) = MenuState::clip_header_row(bottom, context, mount_count, links.len())
+    {
         menu_line(frame, menu_x, clip_header, "├─Clip 🖈       ╾┤");
         draw_links(frame, menu_x, bottom, context, mount_count, menu, links);
     }
@@ -129,7 +186,6 @@ pub fn draw_menu(
 pub fn close_button_hit(menu_x: u16, menu_width: u16, x: u16, y: u16) -> bool {
     y == 0 && x == menu_x.saturating_add(menu_width.saturating_sub(1))
 }
-
 
 fn line_style_index(style: LineStyle) -> usize {
     match style {
@@ -203,7 +259,11 @@ fn draw_links(
 
     if links.is_empty() {
         let y = bottom - 1;
-        let cursor = if menu.section == MenuSection::Clip { "☩" } else { " " };
+        let cursor = if menu.section == MenuSection::Clip {
+            "☩"
+        } else {
+            " "
+        };
         menu_line(frame, menu_x, y, &entry_line(0, cursor, "Empty"));
         return;
     }
@@ -212,8 +272,17 @@ fn draw_links(
     // subsequent links stack upward, and tight terminals simply show fewer.
     for index in 0..visible {
         let y = bottom - 1 - index as u16;
-        let cursor = if menu.section == MenuSection::Clip && menu.clip_cursor == index { "☩" } else { " " };
-        menu_line(frame, menu_x, y, &entry_line(index, cursor, &links[index].label()));
+        let cursor = if menu.section == MenuSection::Clip && menu.clip_cursor == index {
+            "☩"
+        } else {
+            " "
+        };
+        menu_line(
+            frame,
+            menu_x,
+            y,
+            &entry_line(index, cursor, &links[index].label()),
+        );
     }
 }
 
@@ -273,7 +342,6 @@ fn fit_cells(text: &str, width: usize) -> String {
     let clipped = clip_cells(text, width);
     pad_cells(&clipped, width)
 }
-
 
 fn print_at(frame: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
     frame.put_str(x, y, text, style);
