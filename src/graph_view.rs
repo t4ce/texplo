@@ -14,6 +14,7 @@ use std::fs;
 use trueos::async_fs;
 
 use crossterm::style::Color;
+use sha2::{Digest, Sha256};
 
 use crate::{
     layout::{self, LayoutMode, LayoutNode, WorldPos},
@@ -44,9 +45,75 @@ fn trueos_exists(path: &Path) -> io::Result<bool> {
         .map_err(|err| trueos_fs_err("exists", err))
 }
 
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn trueos_is_dir(path: &Path) -> io::Result<bool> {
+    let path = path_to_utf8(path)?;
+    async_fs::block_on(async_fs::metadata(path.as_bytes()))
+        .map(|metadata| metadata.is_dir())
+        .map_err(|err| trueos_fs_err("metadata", err))
+}
+
 #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
 fn trueos_exists(path: &Path) -> io::Result<bool> {
     Ok(path.exists())
+}
+
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+fn trueos_is_dir(path: &Path) -> io::Result<bool> {
+    Ok(fs::metadata(path)?.is_dir())
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn read_file_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let path = path_to_utf8(path)?;
+    async_fs::block_on(async_fs::read_file(path.as_bytes()))
+        .map_err(|err| trueos_fs_err("read_file", err))
+}
+
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+fn read_file_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    fs::read(path)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push(HEX[(byte >> 4) as usize] as char);
+        hex.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    hex
+}
+
+fn unique_archive_destination(preferred: &Path, keep_7z_extension: bool) -> io::Result<PathBuf> {
+    if !trueos_exists(preferred)? {
+        return Ok(preferred.to_path_buf());
+    }
+    let parent = preferred.parent().unwrap_or_else(|| Path::new(""));
+    let name = preferred.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "archive output name is not UTF-8")
+    })?;
+    let base = if keep_7z_extension {
+        name.strip_suffix(".7z").unwrap_or(name)
+    } else {
+        name
+    };
+    for suffix in 2..=999 {
+        let name = if keep_7z_extension {
+            format!("{base}-{suffix}.7z")
+        } else {
+            format!("{base}-{suffix}")
+        };
+        let candidate = parent.join(name);
+        if !trueos_exists(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free archive output name",
+    ))
 }
 
 #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
@@ -221,8 +288,12 @@ pub struct GraphView {
 impl GraphView {
     pub fn from_current_dir() -> io::Result<Self> {
         let root = std::env::current_dir()?;
+        Self::from_path(&root)
+    }
+
+    pub fn from_path(root: &Path) -> io::Result<Self> {
         let mut view = Self {
-            root,
+            root: root.to_path_buf(),
             nodes: Vec::new(),
             positions: Vec::new(),
             edge_cells: Vec::new(),
@@ -736,6 +807,20 @@ impl GraphView {
         self.depth_limit
     }
 
+    pub fn set_depth_limit(&mut self, depth: usize) -> io::Result<usize> {
+        if !DEPTH_LEVELS.contains(&depth) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "depth must be between 0 and 7",
+            ));
+        }
+        if self.depth_limit != depth {
+            self.depth_limit = depth;
+            self.reload()?;
+        }
+        Ok(self.depth_limit)
+    }
+
     pub fn cycle_depth(&mut self) -> io::Result<usize> {
         let current = DEPTH_LEVELS
             .iter()
@@ -908,6 +993,115 @@ impl GraphView {
         self.nodes.get(id)
     }
 
+    pub fn sha256_node(&self, id: usize) -> io::Result<String> {
+        let node = self.node(id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "selected file no longer exists")
+        })?;
+        if node.is_placeholder || node.is_removed || node.hidden || node.is_dir {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "select one regular file",
+            ));
+        }
+
+        let digest = sha256_hex(&read_file_bytes(&node.path)?);
+        Ok(format!("SHA256 · {digest} · {}", node.path.display()))
+    }
+
+    pub fn archive_node(&mut self, id: usize) -> io::Result<String> {
+        let node = self.node(id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "selected item no longer exists")
+        })?;
+        if node.is_placeholder || node.is_removed || node.hidden {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "select one file or folder",
+            ));
+        }
+
+        let source = node.path.clone();
+        let extracting = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("7z"));
+        let preferred = if extracting {
+            source.with_extension("")
+        } else {
+            PathBuf::from(format!("{}.7z", source.display()))
+        };
+        if preferred.as_os_str().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "archive path has no output name",
+            ));
+        }
+        let destination = unique_archive_destination(&preferred, !extracting)?;
+
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        let report = {
+            let source = path_to_utf8(&source)?;
+            let destination = path_to_utf8(&destination)?;
+            if extracting {
+                async_fs::block_on(trueos::archive::unpack(
+                    source.as_bytes(),
+                    destination.as_bytes(),
+                ))
+            } else {
+                async_fs::block_on(trueos::archive::pack(
+                    source.as_bytes(),
+                    destination.as_bytes(),
+                ))
+            }
+            .map_err(|error| trueos_fs_err("archive", error))?
+        };
+
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+        {
+            let destination_arg = if destination.is_absolute() {
+                destination.clone()
+            } else {
+                std::env::current_dir()?.join(&destination)
+            };
+            let status = if extracting {
+                std::process::Command::new("7z")
+                    .arg("x")
+                    .arg("-y")
+                    .arg(&source)
+                    .arg(format!("-o{}", destination.display()))
+                    .status()
+            } else {
+                let parent = source.parent().unwrap_or_else(|| Path::new("."));
+                let name = source.file_name().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "archive source has no name")
+                })?;
+                std::process::Command::new("7z")
+                    .current_dir(parent)
+                    .arg("a")
+                    .arg("-t7z")
+                    .arg("-y")
+                    .arg(&destination_arg)
+                    .arg(name)
+                    .status()
+            }
+            .map_err(|error| io::Error::other(format!("failed to launch 7z: {error}")))?;
+            if !status.success() {
+                return Err(io::Error::other(format!("7z exited with {status}")));
+            }
+        }
+
+        self.reload()?;
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        return Ok(format!(
+            "7Z · {} · {} file(s) · {} → {} bytes",
+            destination.display(),
+            report.file_count,
+            report.input_bytes,
+            report.output_bytes
+        ));
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+        Ok(format!("7Z · {}", destination.display()))
+    }
+
     pub fn label(&self, id: usize) -> String {
         self.node(id)
             .map(|n| {
@@ -1004,6 +1198,22 @@ impl GraphView {
             return false;
         }
         if src.is_dir && self.is_descendant(target, source) {
+            return false;
+        }
+        true
+    }
+
+    pub fn can_move_to_path(&self, source: usize, target: &Path) -> bool {
+        if source == 0 {
+            return false;
+        }
+        let Some(src) = self.node(source) else {
+            return false;
+        };
+        if src.is_placeholder || src.is_removed || src.hidden || src.path.parent() == Some(target) {
+            return false;
+        }
+        if target == src.path || (src.is_dir && target.starts_with(&src.path)) {
             return false;
         }
         true
@@ -1134,6 +1344,31 @@ impl GraphView {
 
         trueos_rename(&src.path, &destination)?;
         let message = format!("MOVE · {} → {}", src.name, dst.name);
+        self.reload()?;
+        Ok(message)
+    }
+
+    pub fn move_node_to_path(&mut self, source: usize, target: &Path) -> io::Result<String> {
+        if !self.can_move_to_path(source, target) || !trueos_is_dir(target)? {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid folder move"));
+        }
+
+        let src = self.node(source).cloned().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "source node disappeared")
+        })?;
+        let name = src.path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "source has no file name")
+        })?;
+        let destination = target.join(name);
+        if trueos_exists(&destination)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists in {}", src.name, target.display()),
+            ));
+        }
+
+        trueos_rename(&src.path, &destination)?;
+        let message = format!("MOVE · {} → {}", src.name, target.display());
         self.reload()?;
         Ok(message)
     }
@@ -1675,5 +1910,18 @@ fn relative_age(when: SystemTime) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sha256_hex;
+
+    #[test]
+    fn sha256_matches_known_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

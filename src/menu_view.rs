@@ -1,5 +1,5 @@
 use crate::{
-    actions::{MenuCommand, MenuContext, MenuLink, MenuSection, MenuState, MENU_ENTRIES},
+    actions::{MenuCommand, MenuContext, MenuLink, MenuSection, MenuState, MountLink, MENU_ENTRIES},
     graph_view::{LineStyle, SelectionStats},
     layout::LayoutMode,
     screen::{text_cell_width, Frame, Style},
@@ -15,8 +15,10 @@ pub fn draw_menu(
     menu: MenuState,
     menu_width: u16,
     context: MenuContext,
+    mounts: &[MountLink],
     links: &[MenuLink],
     stats: Option<&SelectionStats>,
+    zoom_step: usize,
     depth_limit: usize,
     spacing_level: usize,
     line_style: LineStyle,
@@ -33,20 +35,36 @@ pub fn draw_menu(
     menu_line(frame, menu_x, 0, "├─╼ ᗰ ☰ＮＵ╾─┤🯀");
     menu_line(frame, menu_x, 1, "│Use ⌨   Tab  ╰─╮");
     menu_line(frame, menu_x, 2, "├─╼ Mount      ╾┤");
-    menu_line(frame, menu_x, 4, blank);
-    menu_line(frame, menu_x, 5, "├─╼ View       ╾┤");
-    menu_line(frame, menu_x, 11, "│               ╿");
-    menu_line(frame, menu_x, 12, "├─╼ Act        ╾┤");
-
-    if let Some(index) = MenuState::index_for_command(MenuCommand::Reload) {
-        if let Some(y) = MenuState::row_for_index(index, context) {
-            let cursor = if menu.section == MenuSection::Mount && menu.cursor == index { "☩" } else { " " };
-            menu_line(frame, menu_x, y, &entry_line(0, cursor, "first"));
-        }
+    let mount_count = mounts.len().saturating_add(1);
+    let visible_mounts = MenuState::visible_mount_count(mount_count);
+    for index in 0..visible_mounts {
+        let label = if index == 0 {
+            "reload".to_string()
+        } else {
+            mounts[index - 1].menu_label()
+        };
+        let cursor = if menu.section == MenuSection::Mount && menu.mount_cursor == index {
+            "☩"
+        } else {
+            " "
+        };
+        menu_line(frame, menu_x, 3 + index as u16, &entry_line(index, cursor, &label));
     }
+    menu_line(frame, menu_x, 3 + visible_mounts as u16, blank);
+    let view_header = MenuState::view_header_row(mount_count);
+    let action_header = MenuState::action_header_row(mount_count);
+    menu_line(frame, menu_x, view_header, "├─╼ View       ╾┤");
+    menu_line(frame, menu_x, view_header + 7, "│               ╿");
+    menu_line(frame, menu_x, action_header, "├─╼ Act        ╾┤");
 
     let view_rows = [
         (MenuCommand::Center, "center", None, None),
+        (
+            MenuCommand::Zoom,
+            "zoom",
+            Some(toggle_glyph(zoom_step.min(4), 5)),
+            Some(('┝', '┥')),
+        ),
         (MenuCommand::Depth, "depth", Some(TOGGLE_GLYPHS[depth_limit.min(7)]), Some(('╭', '╮'))),
         (MenuCommand::Spacing, "space", Some(spacing_toggle_glyph(spacing_level.min(4))), Some(('┝', '┥'))),
         (MenuCommand::LineStyle, "line", Some(toggle_glyph(line_style_index(line_style), 4)), Some(('┝', '┥'))),
@@ -59,7 +77,7 @@ pub fn draw_menu(
     ];
     for (local, (command, label, toggle, cap)) in view_rows.iter().enumerate() {
         let Some(index) = MenuState::index_for_command(*command) else { continue; };
-        let Some(y) = MenuState::row_for_index(index, context) else { continue; };
+        let Some(y) = MenuState::row_for_index(index, context, mount_count) else { continue; };
         let cursor = if menu.section == MenuSection::View && menu.cursor == index { "☩" } else { " " };
         menu_line(frame, menu_x, y, &view_line(local, cursor, label, *toggle, *cap));
     }
@@ -69,19 +87,19 @@ pub fn draw_menu(
         if entry.section != MenuSection::Action || !MenuState::is_visible(index, context) {
             continue;
         }
-        let Some(y) = MenuState::row_for_index(index, context) else { continue; };
+        let Some(y) = MenuState::row_for_index(index, context, mount_count) else { continue; };
         if y >= bottom { continue; }
         let local = MenuState::local_index(index, context).unwrap_or(0).min(9);
         let cursor = if menu.section == MenuSection::Action && menu.cursor == index { "☩" } else { " " };
         menu_line(frame, menu_x, y, &entry_line(local, cursor, entry.label));
     }
 
-    let action_blank = 13 + MenuState::action_count(context) as u16;
+    let action_blank = action_header + 1 + MenuState::action_count(context) as u16;
     if action_blank < bottom {
         menu_line(frame, menu_x, action_blank, blank);
     }
 
-    if let (Some(header), Some(stats)) = (MenuState::stats_header_row(context), stats) {
+    if let (Some(header), Some(stats)) = (MenuState::stats_header_row(context, mount_count), stats) {
         if header + 5 < bottom {
             menu_line(frame, menu_x, header, "├─╼ Stats      ╾┤");
             let rows = [
@@ -100,9 +118,9 @@ pub fn draw_menu(
         }
     }
 
-    if let Some(clip_header) = MenuState::clip_header_row(bottom, context, links.len()) {
+    if let Some(clip_header) = MenuState::clip_header_row(bottom, context, mount_count, links.len()) {
         menu_line(frame, menu_x, clip_header, "├─Clip 🖈       ╾┤");
-        draw_links(frame, menu_x, bottom, context, menu, links);
+        draw_links(frame, menu_x, bottom, context, mount_count, menu, links);
     }
 
     menu_line(frame, menu_x, bottom, "╰───────────────╯");
@@ -174,10 +192,11 @@ fn draw_links(
     menu_x: u16,
     bottom: u16,
     context: MenuContext,
+    mount_count: usize,
     menu: MenuState,
     links: &[MenuLink],
 ) {
-    let visible = MenuState::clip_visible_count(bottom, context, links.len());
+    let visible = MenuState::clip_visible_count(bottom, context, mount_count, links.len());
     if visible == 0 {
         return;
     }
@@ -202,17 +221,18 @@ pub fn link_index_for_row(
     row: u16,
     bottom: u16,
     context: MenuContext,
+    mount_count: usize,
     link_count: usize,
 ) -> Option<usize> {
     if link_count == 0 || row >= bottom {
         return None;
     }
-    let header = MenuState::clip_header_row(bottom, context, link_count)?;
+    let header = MenuState::clip_header_row(bottom, context, mount_count, link_count)?;
     if row <= header {
         return None;
     }
     let index = bottom.saturating_sub(1).saturating_sub(row) as usize;
-    let visible = MenuState::clip_visible_count(bottom, context, link_count);
+    let visible = MenuState::clip_visible_count(bottom, context, mount_count, link_count);
     (index < visible).then_some(index)
 }
 

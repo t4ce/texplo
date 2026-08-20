@@ -14,9 +14,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+use std::io::Write;
+
 use actions::{
     dispatch_menu, draw_modal, execute_modal, modal_click,
-    Dispatch, MenuContext, MenuLink, MenuSection, MenuState, Modal, PendingAction, MENU_ENTRIES,
+    Dispatch, MenuContext, MenuLink, MenuSection, MenuState, Modal, MountLink, PendingAction,
+    MENU_ENTRIES,
 };
 use crossterm::{
     cursor::{Hide, Show},
@@ -46,12 +50,17 @@ const MIN_CONTENT_HEIGHT: u16 = 27;
 const TICK: Duration = Duration::from_millis(16);
 const MAX_EVENT_BATCH: usize = 64;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(70);
-const BUILD_ID: &str = "v0.22 · half-screen overscroll + map scrub";
+const BUILD_ID: &str = "v0.25 · tde root + depth + archive";
 const FALL_TICK: Duration = Duration::from_millis(90);
+const ZOOM_LEVELS: [u16; 5] = [75, 100, 125, 150, 200];
+const DEFAULT_ZOOM_STEP: usize = 1;
+const RULE_TITLE_SEPARATOR: &str = "・・";
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Config {
     diagnostics: bool,
+    initial_path: Option<PathBuf>,
+    initial_depth: Option<usize>,
 }
 
 impl Config {
@@ -66,7 +75,21 @@ impl Config {
             })
             .unwrap_or(false);
 
+        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+        let (mut initial_path, initial_depth) = {
+            let directives = launch_directives();
+            (directives.browse_path, directives.depth)
+        };
+        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+        let (mut initial_path, initial_depth) = (None, None);
+        let mut browse_value = false;
+
         for arg in env::args().skip(1) {
+            if browse_value {
+                initial_path = Some(PathBuf::from(arg));
+                browse_value = false;
+                continue;
+            }
             match arg.as_str() {
                 "--diagnostics" | "--diagnostic" | "--diag" | "-d" => {
                     diagnostics = true;
@@ -74,12 +97,119 @@ impl Config {
                 "--no-diagnostics" | "--no-diagnostic" => {
                     diagnostics = false;
                 }
+                "--browse" | "--path" => browse_value = true,
+                _ if arg.starts_with("--browse=") => {
+                    initial_path = Some(PathBuf::from(&arg["--browse=".len()..]));
+                }
+                _ if !arg.starts_with('-') => initial_path = Some(PathBuf::from(arg)),
                 _ => {}
             }
         }
 
-        Self { diagnostics }
+        Self {
+            diagnostics,
+            initial_path,
+            initial_depth,
+        }
     }
+}
+
+#[derive(Default)]
+struct LaunchDirectives {
+    browse_path: Option<PathBuf>,
+    depth: Option<usize>,
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn launch_directives() -> LaunchDirectives {
+    let Ok(bytes) = trueos::async_fs::block_on(trueos::async_fs::read_file(b"vFile:launch")) else {
+        return LaunchDirectives::default();
+    };
+    let Ok(script) = String::from_utf8(bytes) else {
+        return LaunchDirectives::default();
+    };
+    launch_directives_from_script(script.as_str())
+}
+
+fn launch_directives_from_script(script: &str) -> LaunchDirectives {
+    let mut directives = LaunchDirectives::default();
+    for line in script.lines().map(str::trim) {
+        let browse = line
+            .strip_prefix("browse ")
+            .map(str::trim)
+            .or_else(|| (line == "browse/").then_some("/"));
+        if let Some(path) = browse.filter(|path| !path.is_empty()) {
+            directives.browse_path = Some(PathBuf::from(path));
+            continue;
+        }
+        if let Some(depth) = line
+            .strip_prefix("depth ")
+            .map(str::trim)
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|depth| *depth <= 7)
+        {
+            directives.depth = Some(depth);
+        }
+    }
+    directives
+}
+
+fn browse_path_from_script(script: &str) -> Option<PathBuf> {
+    launch_directives_from_script(script).browse_path
+}
+
+#[cfg(test)]
+mod launch_script_tests {
+    use super::{browse_path_from_script, launch_directives_from_script};
+    use std::path::PathBuf;
+
+    #[test]
+    fn uses_the_last_nonempty_browse_directive() {
+        assert_eq!(
+            browse_path_from_script("fs-scope trueosfs\nbrowse /\nbrowse trueosfs:disc4/apps\n"),
+            Some(PathBuf::from("trueosfs:disc4/apps"))
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_or_empty_directives() {
+        assert_eq!(
+            browse_path_from_script("fs-scope trueosfs\nbrowse   \n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_tde_root_and_depth_defaults() {
+        let directives =
+            launch_directives_from_script("fs-scope trueosfs\nbrowse/\ndepth 2\n");
+        assert_eq!(directives.browse_path, Some(PathBuf::from("/")));
+        assert_eq!(directives.depth, Some(2));
+    }
+}
+
+#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+fn available_mounts(_graph: &GraphView) -> Vec<MountLink> {
+    trueos::async_fs::block_on(trueos::async_fs::list_mounts())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mount| MountLink {
+            path: PathBuf::from(mount.selector),
+            label: mount.label,
+            primary: mount.primary,
+            read_only: mount.read_only,
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+fn available_mounts(graph: &GraphView) -> Vec<MountLink> {
+    vec![MountLink {
+        path: graph.root_path().to_path_buf(),
+        label: "current".to_string(),
+        primary: true,
+        read_only: false,
+    }]
 }
 
 struct TerminalGuard {
@@ -184,6 +314,8 @@ struct App {
     logs: VecDeque<String>,
     falling: Option<FallingGhost>,
     links: Vec<MenuLink>,
+    mounts: Vec<MountLink>,
+    zoom_step: usize,
     diagnostics: bool,
     resize_deadline: Option<Instant>,
     should_exit: bool,
@@ -193,10 +325,18 @@ struct App {
 
 impl App {
     fn new(config: Config) -> io::Result<Self> {
-        let graph = GraphView::from_current_dir()?;
+        let mut graph = match config.initial_path.as_deref() {
+            Some(path) => GraphView::from_path(path)?,
+            None => GraphView::from_current_dir()?,
+        };
+        if let Some(depth) = config.initial_depth {
+            graph.set_depth_limit(depth)?;
+        }
+        let mounts = available_mounts(&graph);
         let mut logs = VecDeque::new();
         logs.push_back(format!("⇝ {BUILD_ID}"));
         logs.push_back(format!("⇝ Mounted {}", graph.root_label()));
+        logs.push_back(format!("⇝ {} filesystem root mount(s)", mounts.len()));
         logs.push_back("⇝ LMB select/drag · MMB/WASD/arrows pan · Home center".to_string());
         logs.push_back("⇝ Tab changes menu segment · 0..9 runs local segment item".to_string());
         #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
@@ -217,6 +357,8 @@ impl App {
             logs,
             falling: None,
             links: Vec::new(),
+            mounts,
+            zoom_step: DEFAULT_ZOOM_STEP,
             diagnostics: config.diagnostics,
             resize_deadline: None,
             should_exit: false,
@@ -623,6 +765,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> io::Resu
                         MenuState::clip_visible_count(
                             layout.separator_y,
                             context,
+                            app.mounts.len().saturating_add(1),
                             app.links.len(),
                         )
                     })
@@ -635,6 +778,16 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> io::Resu
                     open_link(app, link_index)?;
                 } else if ch == '0' && app.links.is_empty() && visible > 0 {
                     app.log("CLIP · Empty");
+                }
+            } else if app.menu.section == MenuSection::Mount {
+                let mount_count = app.mounts.len().saturating_add(1);
+                if let Some(index) = ch
+                    .to_digit(10)
+                    .map(|index| index as usize)
+                    .filter(|index| *index < MenuState::visible_mount_count(mount_count))
+                {
+                    app.menu.set_mount_cursor(index, mount_count);
+                    open_mount(app, index)?;
                 }
             } else if let Some(index) = app.menu.index_for_hotkey(ch, context) {
                 app.menu.set_cursor(index, context);
@@ -654,7 +807,12 @@ fn cycle_menu_section(app: &mut App, reverse: bool) {
             .ok()
             .flatten()
             .and_then(|layout| {
-                MenuState::clip_header_row(layout.separator_y, context, app.links.len())
+                MenuState::clip_header_row(
+                    layout.separator_y,
+                    context,
+                    app.mounts.len().saturating_add(1),
+                    app.links.len(),
+                )
             })
             .is_some();
         if !clip_visible {
@@ -775,7 +933,15 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         && app.pan.is_none()
     {
         let context = app.menu_context();
-        if let Some(index) = MenuState::index_for_row(mouse.row, context) {
+        let mount_count = app.mounts.len().saturating_add(1);
+        if let Some(mount_index) = MenuState::mount_index_for_row(mouse.row, mount_count) {
+            if app.menu.set_mount_cursor(mount_index, mount_count) {
+                app.mark_dirty();
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                open_mount(app, mount_index)?;
+            }
+        } else if let Some(index) = MenuState::index_for_row(mouse.row, context, mount_count) {
             if app.menu.set_cursor(index, context) {
                 app.mark_dirty();
             }
@@ -786,13 +952,20 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
             mouse.row,
             layout.separator_y,
             context,
+            mount_count,
             app.links.len(),
         ) {
             if app.menu.set_section(section, context) {
                 app.mark_dirty();
             }
         } else if let Some(link_index) =
-            link_index_for_row(mouse.row, layout.separator_y, context, app.links.len())
+            link_index_for_row(
+                mouse.row,
+                layout.separator_y,
+                context,
+                mount_count,
+                app.links.len(),
+            )
         {
             if app.menu.set_clip_cursor(link_index, app.links.len()) {
                 app.mark_dirty();
@@ -875,7 +1048,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                     let over_minimap = !over_menu
                         && !over_trash
                         && minimap_hit(app, layout, mouse.column, mouse.row);
-                    let target = if over_trash || over_menu || over_minimap {
+                    let path_target = if over_trash || over_menu || over_minimap || mouse.row != 0 {
+                        None
+                    } else {
+                        breadcrumb_drop_target_at(app, layout, mouse.column, press.node)
+                    };
+                    app.set_path_hover(path_target.clone());
+                    let target = if over_trash || over_menu || over_minimap || path_target.is_some() {
                         None
                     } else {
                         app.graph.folder_drop_target(
@@ -902,6 +1081,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         }
         MouseEventKind::Up(_) => {
             if let Some(drag) = app.drag.take() {
+                let path_target = (mouse.row == 0)
+                    .then(|| breadcrumb_drop_target_at(app, layout, mouse.column, drag.node))
+                    .flatten();
                 let dropped_in_menu = drag.over_menu
                     || (mouse.column >= layout.menu_x && mouse.row <= layout.separator_y);
                 let dropped_in_trash = !dropped_in_menu
@@ -915,6 +1097,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                         Modal::trash_node(&app.graph, drag.node).with_origin_y(mouse.row),
                     );
                     app.mark_dirty();
+                } else if let Some(target) = path_target {
+                    app.modal = Some(Modal::move_to_path(&app.graph, drag.node, target));
+                    app.mark_dirty();
                 } else if let Some(target) = drag.target {
                     app.modal = Some(Modal::move_node(&app.graph, drag.node, target));
                     app.mark_dirty();
@@ -922,6 +1107,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                     app.log("MOVE · cancelled · target must be a valid folder");
                 }
             }
+            app.set_path_hover(None);
             app.press = None;
             app.mark_dirty();
         }
@@ -1016,10 +1202,37 @@ fn open_link(app: &mut App, index: usize) -> io::Result<()> {
     Ok(())
 }
 
+fn open_mount(app: &mut App, index: usize) -> io::Result<()> {
+    let result: io::Result<String> = if index == 0 {
+        app.graph.reload().map(|()| {
+            app.mounts = available_mounts(&app.graph);
+            format!("MOUNT · refreshed {} root(s)", app.mounts.len())
+        })
+    } else {
+        let Some(mount) = app.mounts.get(index - 1).cloned() else {
+            return Ok(());
+        };
+        app.graph
+            .mount_path(&mount.path)
+            .map(|()| format!("MOUNT · {}", mount.label))
+    };
+
+    match result {
+        Ok(status) => {
+            app.set_selected(None);
+            app.clear_transient();
+            app.log(status);
+        }
+        Err(err) => app.log(format!("MOUNT FAILED · {err}")),
+    }
+    Ok(())
+}
+
 fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
     let entry = MENU_ENTRIES[index];
     match dispatch_menu(entry.command, &mut app.graph, app.selected)? {
         Dispatch::Exit => app.should_exit = true,
+        Dispatch::Zoom => cycle_terminal_zoom(app)?,
         Dispatch::Modal(mut modal) => {
             if modal.trash_origin_y.is_none() {
                 let trash_source = match &modal.pending {
@@ -1042,12 +1255,31 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
                     | actions::MenuCommand::Parent
                     | actions::MenuCommand::Enter
                     | actions::MenuCommand::Depth
+                    | actions::MenuCommand::Zip
             ) {
                 app.set_selected(None);
                 app.clear_transient();
             }
             app.log(status);
         }
+    }
+    Ok(())
+}
+
+fn cycle_terminal_zoom(app: &mut App) -> io::Result<()> {
+    #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
+    {
+        let next = (app.zoom_step + 1) % ZOOM_LEVELS.len();
+        let percent = ZOOM_LEVELS[next];
+        let mut output = stdout().lock();
+        write!(output, "\x1b]777;terminal_zoom={percent}\x07")?;
+        output.flush()?;
+        app.zoom_step = next;
+        app.log(format!("VIEW · zoom {percent}%"));
+    }
+    #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
+    {
+        app.log("VIEW · zoom is controlled by the host terminal");
     }
     Ok(())
 }
@@ -1225,8 +1457,10 @@ fn compose_frame(app: &mut App) -> io::Result<Frame> {
         app.menu,
         MENU_WIDTH,
         app.menu_context(),
+        &app.mounts,
         &app.links,
         app.selected_stats.as_ref(),
+        app.zoom_step,
         app.graph.depth_limit(),
         app.graph.spacing_level(),
         app.graph.line_style(),
@@ -1300,12 +1534,30 @@ fn breadcrumb_target_at(app: &App, layout: Layout, x: u16) -> Option<PathBuf> {
         .map(|crumb| crumb.path)
 }
 
+fn breadcrumb_drop_target_at(
+    app: &App,
+    layout: Layout,
+    x: u16,
+    source: usize,
+) -> Option<PathBuf> {
+    let map_width = text_cell_width("🗺  ") as u16;
+    let crumbs = breadcrumb_layout(app.graph.root_path(), map_width, layout.menu_x)?;
+    crumbs
+        .crumbs
+        .into_iter()
+        .find(|crumb| x >= crumb.x && x < crumb.x.saturating_add(crumb.width))
+        .map(|crumb| crumb.path)
+        .filter(|path| app.graph.can_move_to_path(source, path))
+}
+
 fn breadcrumb_layout(path: &Path, start_x: u16, end_x: u16) -> Option<BreadcrumbLayout> {
     let width = end_x.saturating_sub(start_x) as usize;
     if width < 8 {
         return None;
     }
-    let max_content = width.saturating_sub(6);
+    let separator_width = text_cell_width(RULE_TITLE_SEPARATOR);
+    let separator_pair_width = separator_width.saturating_mul(2);
+    let max_content = width.saturating_sub(separator_pair_width);
     if max_content == 0 {
         return None;
     }
@@ -1346,9 +1598,9 @@ fn breadcrumb_layout(path: &Path, start_x: u16, end_x: u16) -> Option<Breadcrumb
         content_width = prefix_width + labels.last().map(|s| text_cell_width(s)).unwrap_or(0);
     }
 
-    let block_width = content_width.saturating_add(6).min(width);
+    let block_width = content_width.saturating_add(separator_pair_width).min(width);
     let block_x = start_x + ((width - block_width) / 2) as u16;
-    let content_x = block_x.saturating_add(3);
+    let content_x = block_x.saturating_add(separator_width as u16);
     let mut cursor = content_x;
     if let Some(prefix) = &prefix {
         cursor = cursor.saturating_add(text_cell_width(prefix) as u16);
@@ -1409,15 +1661,19 @@ fn path_components(path: &Path) -> Vec<(String, PathBuf)> {
 }
 
 fn draw_breadcrumb(frame: &mut Frame, app: &App, layout: &BreadcrumbLayout) {
-    // Leave the two patterned cells on each side untouched so 🞃🞁/🞁🞃
-    // always continues from absolute column parity rather than from title
-    // string length.
-    print_at(frame, layout.block_x + 2, 0, " ", Style::default());
+    // The wide centered middle dots bridge the text and Braille rule.
+    print_at(
+        frame,
+        layout.block_x,
+        0,
+        RULE_TITLE_SEPARATOR,
+        Style::default(),
+    );
     print_at(
         frame,
         layout.content_x + layout.content_width,
         0,
-        " ",
+        RULE_TITLE_SEPARATOR,
         Style::default(),
     );
 
@@ -1437,7 +1693,9 @@ fn draw_breadcrumb(frame: &mut Frame, app: &App, layout: &BreadcrumbLayout) {
         }
 
         let mut style = Style::default();
-        if crumb.is_last {
+        if app.drag.is_some() && app.path_hover.as_ref() == Some(&crumb.path) {
+            style = Style::new(Color::Black, Color::Cyan);
+        } else if crumb.is_last {
             style = style.bold();
         } else if app.path_hover.as_ref() == Some(&crumb.path) {
             style = style.underline();
@@ -1565,27 +1823,26 @@ fn draw_rule_title(
 ) {
     let width = end_x.saturating_sub(start_x) as usize;
     draw_pattern(frame, start_x, y, end_x, first, second);
-    if width < 7 || title.is_empty() {
+    let separator_width = text_cell_width(RULE_TITLE_SEPARATOR);
+    let separator_pair_width = separator_width.saturating_mul(2);
+    if width <= separator_pair_width || title.is_empty() {
         return;
     }
 
-    let title_width = width.saturating_sub(6).max(1);
+    let title_width = width.saturating_sub(separator_pair_width).max(1);
     let visible = clip_text_tail_cells(title, title_width);
     let visible_width = text_cell_width(&visible);
-    let block_width = visible_width.saturating_add(6).min(width);
+    let block_width = visible_width.saturating_add(separator_pair_width).min(width);
     let block_x = start_x + ((width - block_width) / 2) as u16;
-    let text_x = block_x.saturating_add(3);
+    let text_x = block_x.saturating_add(separator_width as u16);
 
-    // The two cells on either side remain the original alternating pattern.
-    // Only the inner spaces and text are overpainted, so the sequence cannot
-    // produce doubled 🞁🞁 or 🞃🞃 at title boundaries.
-    print_at(frame, block_x + 2, y, " ", Style::default());
+    print_at(frame, block_x, y, RULE_TITLE_SEPARATOR, Style::default());
     print_at(frame, text_x, y, &visible, Style::default());
     print_at(
         frame,
         text_x.saturating_add(visible_width as u16),
         y,
-        " ",
+        RULE_TITLE_SEPARATOR,
         Style::default(),
     );
 }
