@@ -16,3 +16,13 @@
         };
     };
 }
+
+
+# nix run --refresh github:GlassGhost/texplo
+# or
+# git clone https://github.com/GlassGhost/texplo
+# cd ./texplo
+# nix run
+# nix build
+# ./make-flake.sh
+# ./upd8cargo.sh
