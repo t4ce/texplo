@@ -103,56 +103,10 @@ fn unique_archive_destination(preferred: &Path, keep_7z_extension: bool) -> io::
 }
 
 fn trueos_rename(source: &Path, destination: &Path) -> io::Result<()> {
-    let source_path = path_to_utf8(source)?;
-    let metadata = async_fs::block_on(async_fs::metadata(source_path.as_bytes()))
-        .map_err(|err| trueos_fs_err("metadata", err))?;
-    if metadata.is_dir() {
-        trueos_rename_dir(source, destination)?;
-    } else {
-        trueos_rename_file(source, destination)?;
-    }
-    Ok(())
-}
-
-fn trueos_rename_file(source: &Path, destination: &Path) -> io::Result<()> {
     let source = path_to_utf8(source)?;
     let destination = path_to_utf8(destination)?;
-    let bytes = async_fs::block_on(async_fs::read_file(source.as_bytes()))
-        .map_err(|err| trueos_fs_err("read_file", err))?;
-    async_fs::block_on(async_fs::write_file(destination.as_bytes(), &bytes))
-        .map_err(|err| trueos_fs_err("write_file", err))?;
-    async_fs::block_on(async_fs::remove(source.as_bytes()))
-        .map_err(|err| trueos_fs_err("remove", err))?;
-    Ok(())
-}
-
-fn trueos_rename_dir(source: &Path, destination: &Path) -> io::Result<()> {
-    let source_path = path_to_utf8(source)?;
-    let destination_path = path_to_utf8(destination)?;
-    async_fs::block_on(async_fs::create_dir_all(destination_path.as_bytes()))
-        .map_err(|err| trueos_fs_err("create_dir_all", err))?;
-
-    let listing = async_fs::block_on(async_fs::list_dir_utf8(source_path.as_bytes()))
-        .map_err(|err| trueos_fs_err("list_dir_utf8", err))?;
-    for name in listing.lines() {
-        if name.is_empty() || name == "." || name == ".." {
-            continue;
-        }
-        let child_source = source.join(name);
-        let child_destination = destination.join(name);
-        let child_meta =
-            async_fs::block_on(async_fs::metadata(path_to_utf8(&child_source)?.as_bytes()))
-                .map_err(|err| trueos_fs_err("metadata", err))?;
-        if child_meta.is_dir() {
-            trueos_rename_dir(&child_source, &child_destination)?;
-        } else {
-            trueos_rename_file(&child_source, &child_destination)?;
-        }
-    }
-
-    async_fs::block_on(async_fs::remove(source_path.as_bytes()))
-        .map_err(|err| trueos_fs_err("remove", err))?;
-    Ok(())
+    async_fs::block_on(async_fs::rename(source.as_bytes(), destination.as_bytes()))
+        .map_err(|err| trueos_fs_err("rename", err))
 }
 
 #[derive(Clone, Copy, Debug)]

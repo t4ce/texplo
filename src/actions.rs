@@ -71,7 +71,7 @@ pub struct MenuEntry {
 
 // The visual order is the contract from ☰enu_Rework.txt. Local hotkeys are
 // assigned after contextual filtering, so every section reuses 🯰..🯹/0..9.
-pub const MENU_ENTRIES: [MenuEntry; 13] = [
+pub const MENU_ENTRIES: [MenuEntry; 14] = [
     MenuEntry {
         label: "center",
         command: MenuCommand::Center,
@@ -115,6 +115,11 @@ pub const MENU_ENTRIES: [MenuEntry; 13] = [
     MenuEntry {
         label: "new 🖹",
         command: MenuCommand::NewFile,
+        section: MenuSection::Action,
+    },
+    MenuEntry {
+        label: "name",
+        command: MenuCommand::Rename,
         section: MenuSection::Action,
     },
     MenuEntry {
@@ -362,11 +367,10 @@ impl MenuState {
             MenuCommand::NewFolder | MenuCommand::NewFile => {
                 matches!(context, MenuContext::None | MenuContext::Folder)
             }
-            MenuCommand::Delete => matches!(context, MenuContext::File | MenuContext::Folder),
-            MenuCommand::Parent
-            | MenuCommand::TreeLayout
-            | MenuCommand::RadialLayout
-            | MenuCommand::Rename => false,
+            MenuCommand::Delete | MenuCommand::Rename => {
+                matches!(context, MenuContext::File | MenuContext::Folder)
+            }
+            MenuCommand::Parent | MenuCommand::TreeLayout | MenuCommand::RadialLayout => false,
         }
     }
 
@@ -754,7 +758,9 @@ pub fn dispatch_menu(
         },
         MenuCommand::Rename => match selected {
             Some(source) => Ok(Dispatch::Modal(Modal::rename(graph, source))),
-            None => Ok(Dispatch::Status("NAME · select a file first".to_string())),
+            None => Ok(Dispatch::Status(
+                "NAME · select a file or folder first".to_string(),
+            )),
         },
         MenuCommand::NewFolder => {
             let parent = selected
@@ -1049,4 +1055,20 @@ fn clip_text_tail(text: &str, max: usize) -> String {
 
 fn print_at(frame: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
     frame.put_str(x, y, text, style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MenuCommand, MenuContext, MenuState};
+
+    #[test]
+    fn name_action_is_visible_and_clickable_for_files_and_folders() {
+        let index = MenuState::index_for_command(MenuCommand::Rename).unwrap();
+        for context in [MenuContext::File, MenuContext::Folder] {
+            assert!(MenuState::is_visible(index, context));
+            let row = MenuState::row_for_index(index, context, 1).unwrap();
+            assert_eq!(MenuState::index_for_row(row, context, 1), Some(index));
+        }
+        assert!(!MenuState::is_visible(index, MenuContext::None));
+    }
 }
