@@ -1,4 +1,4 @@
-use crate::chronos::{elapsed_since, Duration, SystemTime};
+use crate::chronos::{Duration, SystemTime, elapsed_since};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     layout::{self, LayoutMode, LayoutNode, WorldPos},
-    screen::{terminal_cell_width, text_cell_width, Frame, Style},
+    screen::{Frame, Style, terminal_cell_width, text_cell_width},
 };
 
 const HARD_MAX_DEPTH: usize = 256;
@@ -336,7 +336,7 @@ impl GraphView {
             return Ok(false);
         }
 
-        let entries = match self.read_dir_entries(dir) {
+        let (entries, listing_truncated) = match self.read_dir_entries(dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return Ok(false),
             Err(err) => return Err(err),
@@ -345,7 +345,7 @@ impl GraphView {
         // Only inspect enough directory entries to establish the per-folder cap.
         // This keeps an enormous directory from becoming an enormous allocation.
         let mut children = Vec::new();
-        let mut directory_truncated = false;
+        let mut directory_truncated = listing_truncated;
         for (mut_is_folder, name, path, is_dir, is_symlink) in entries {
             if children.len() >= MAX_CHILDREN_PER_DIR {
                 directory_truncated = true;
@@ -408,27 +408,25 @@ impl GraphView {
         Ok(false)
     }
 
-    fn read_dir_entries(&self, dir: &Path) -> io::Result<Vec<(bool, String, PathBuf, bool, bool)>> {
+    fn read_dir_entries(
+        &self,
+        dir: &Path,
+    ) -> io::Result<(Vec<(bool, String, PathBuf, bool, bool)>, bool)> {
         let mut entries = Vec::new();
         let path = dir.to_str().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8")
         })?;
-        let listing = async_fs::block_on(async_fs::list_dir_utf8(path.as_bytes()))
-            .map_err(|err| io::Error::other(format!("list_dir_utf8 failed ({err})")))?;
-        for name in listing.lines() {
-            if name.is_empty() || name == ".explorer-trash" {
+        let listing = async_fs::block_on(async_fs::list_dir(path.as_bytes()))
+            .map_err(|err| io::Error::other(format!("list_dir failed ({err})")))?;
+        for entry in listing.entries {
+            if entry.name == ".explorer-trash" {
                 continue;
             }
-            let child_path = dir.join(name);
-            let child_path_str = child_path.to_str().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "child path is not valid UTF-8")
-            })?;
-            let is_dir = async_fs::block_on(async_fs::metadata(child_path_str.as_bytes()))
-                .map(|metadata| metadata.is_dir())
-                .unwrap_or(false);
-            entries.push((!is_dir, name.to_string(), child_path, is_dir, false));
+            let is_dir = matches!(entry.kind, async_fs::NodeKind::Directory);
+            let child_path = dir.join(entry.name.as_str());
+            entries.push((!is_dir, entry.name, child_path, is_dir, false));
         }
-        Ok(entries)
+        Ok((entries, listing.truncated))
     }
 
     fn push_placeholder(&mut self, parent_id: usize, depth: usize) {
