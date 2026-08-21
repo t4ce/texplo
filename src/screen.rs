@@ -1,4 +1,4 @@
-use std::io::{self, Stdout, Write};
+use std::io::{self, Write};
 
 use crossterm::{
     cursor::MoveTo,
@@ -49,7 +49,10 @@ impl Default for Style {
 // Keep the table intentionally local and dependency-free.
 pub fn terminal_cell_width(ch: char) -> u16 {
     match ch {
-        '🪦' | '☰' | 'Ｎ' | 'Ｕ' | '＃' => 2,
+        // Shell2's terminal treats the Japanese middle dot as wide. It is
+        // used in Texplo's slash-free breadcrumbs and title delimiters, so it
+        // must occupy the same two cells in retained frames and hit layouts.
+        '🪦' | '☰' | 'Ｎ' | 'Ｕ' | '＃' | '・' => 2,
         _ => 1,
     }
 }
@@ -235,7 +238,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn present(&mut self, out: &mut Stdout, next: Frame) -> io::Result<()> {
+    pub fn present<W: Write>(&mut self, out: &mut W, next: Frame) -> io::Result<()> {
         match self.previous.as_ref() {
             None => {
                 queue!(out, ResetColor, MoveTo(0, 0), Clear(ClearType::All))?;
@@ -255,7 +258,7 @@ impl Renderer {
         Ok(())
     }
 
-    fn paint_nonblank(&self, out: &mut Stdout, frame: &Frame) -> io::Result<()> {
+    fn paint_nonblank<W: Write>(&self, out: &mut W, frame: &Frame) -> io::Result<()> {
         for y in 0..frame.height() {
             let mut x = 0;
             while x < frame.width() {
@@ -297,14 +300,14 @@ impl Renderer {
         Ok(())
     }
 
-    fn paint_all(&self, out: &mut Stdout, frame: &Frame) -> io::Result<()> {
+    fn paint_all<W: Write>(&self, out: &mut W, frame: &Frame) -> io::Result<()> {
         for y in 0..frame.height() {
             self.paint_range(out, frame, y, 0, frame.width())?;
         }
         Ok(())
     }
 
-    fn paint_diff(&self, out: &mut Stdout, previous: &Frame, next: &Frame) -> io::Result<()> {
+    fn paint_diff<W: Write>(&self, out: &mut W, previous: &Frame, next: &Frame) -> io::Result<()> {
         let width = next.width() as usize;
         let mut dirty = vec![false; width];
         for y in 0..next.height() {
@@ -333,9 +336,9 @@ impl Renderer {
         Ok(())
     }
 
-    fn paint_range(
+    fn paint_range<W: Write>(
         &self,
-        out: &mut Stdout,
+        out: &mut W,
         frame: &Frame,
         y: u16,
         start: u16,
@@ -395,7 +398,7 @@ fn mark_footprint(dirty: &mut [bool], frame: &Frame, x: u16, y: u16) {
     }
 }
 
-fn paint_run(out: &mut Stdout, x: u16, y: u16, style: Style, text: &str) -> io::Result<()> {
+fn paint_run<W: Write>(out: &mut W, x: u16, y: u16, style: Style, text: &str) -> io::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
@@ -413,4 +416,56 @@ fn paint_run(out: &mut Stdout, x: u16, y: u16, style: Style, text: &str) -> io::
         queue!(out, SetAttribute(Attribute::Underlined))?;
     }
     queue!(out, Print(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{terminal_cell_width, text_cell_width, Frame, Renderer, Style};
+    use std::io::{self, BufWriter, Write};
+
+    #[derive(Debug, Default)]
+    struct RecordingWriter {
+        writes: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn presents_a_small_frame_in_one_buffered_write() {
+        let mut frame = Frame::new(8, 1);
+        frame.put_str(0, 0, "texplo", Style::default());
+
+        let mut renderer = Renderer::default();
+        let mut output = BufWriter::with_capacity(64 * 1024, RecordingWriter::default());
+        renderer.present(&mut output, frame).unwrap();
+
+        let output = output.into_inner().unwrap();
+        assert_eq!(output.writes, 1);
+        assert!(output.bytes.windows(6).any(|window| window == b"texplo"));
+    }
+
+    #[test]
+    fn japanese_middle_dot_occupies_two_cells_in_a_frame() {
+        let mut frame = Frame::new(4, 1);
+        let style = Style::default().underline();
+        frame.put_str(0, 0, "・x", style);
+
+        assert_eq!(terminal_cell_width('・'), 2);
+        assert_eq!(text_cell_width("・・"), 4);
+        assert!(frame.cell(0, 0).style.underline);
+        assert!(frame.cell(1, 0).is_continuation());
+        assert!(frame.cell(1, 0).style.underline);
+        assert_eq!(frame.cell(2, 0).ch, 'x');
+    }
 }

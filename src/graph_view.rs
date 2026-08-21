@@ -1,4 +1,4 @@
-use crate::chronos::{Duration, SystemTime, elapsed_since};
+use crate::chronos::{elapsed_since, Duration, SystemTime};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     layout::{self, LayoutMode, LayoutNode, WorldPos},
-    screen::{Frame, Style, terminal_cell_width, text_cell_width},
+    screen::{terminal_cell_width, text_cell_width, Frame, Style},
 };
 
 const HARD_MAX_DEPTH: usize = 256;
@@ -19,6 +19,13 @@ const DEPTH_LEVELS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 const DEFAULT_DEPTH_LIMIT: usize = 4;
 const MAX_CHILDREN_PER_DIR: usize = 256;
 const MAX_VISIBLE_NODES: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sha256Result {
+    pub source: usize,
+    pub digest: String,
+    pub path: PathBuf,
+}
 
 fn path_to_utf8(path: &Path) -> io::Result<&str> {
     path.to_str()
@@ -898,7 +905,7 @@ impl GraphView {
         self.nodes.get(id)
     }
 
-    pub fn sha256_node(&self, id: usize) -> io::Result<String> {
+    pub fn sha256_node(&self, id: usize) -> io::Result<Sha256Result> {
         let node = self.node(id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "selected file no longer exists")
         })?;
@@ -910,7 +917,11 @@ impl GraphView {
         }
 
         let digest = sha256_hex(&read_file_bytes(&node.path)?);
-        Ok(format!("SHA256 · {digest} · {}", node.path.display()))
+        Ok(Sha256Result {
+            source: id,
+            digest,
+            path: node.path.clone(),
+        })
     }
 
     pub fn archive_node(&mut self, id: usize) -> io::Result<String> {

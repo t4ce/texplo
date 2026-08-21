@@ -3,7 +3,7 @@ use std::{io, path::PathBuf};
 use crossterm::style::Color;
 
 use crate::{
-    graph_view::{GraphView, Viewport},
+    graph_view::{GraphView, Sha256Result, Viewport},
     layout::LayoutMode,
     screen::{Frame, Style},
 };
@@ -664,6 +664,7 @@ pub enum Dispatch {
     Exit,
     Zoom,
     Modal(Modal),
+    Sha256(Sha256Result),
     Status(String),
 }
 
@@ -734,10 +735,10 @@ pub fn dispatch_menu(
             )),
         },
         MenuCommand::Sha256 => match selected {
-            Some(source) => Ok(Dispatch::Status(match graph.sha256_node(source) {
-                Ok(status) => status,
-                Err(err) => format!("SHA256 FAILED · {err}"),
-            })),
+            Some(source) => match graph.sha256_node(source) {
+                Ok(result) => Ok(Dispatch::Sha256(result)),
+                Err(err) => Ok(Dispatch::Status(format!("SHA256 FAILED · {err}"))),
+            },
             None => Ok(Dispatch::Status(
                 "SHA256 · select one file first".to_string(),
             )),
