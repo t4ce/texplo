@@ -7,7 +7,7 @@ Texplo directly uses the TRUEOS terminal lease, clock, archive, collections, and
 Build the application through the TRUEOS Blueprint toolchain:
 
 ```sh
-cd ../TRUEOS-Blueprints
+cd ../..
 cargo bp texplo
 ```
 
