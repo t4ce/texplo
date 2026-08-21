@@ -190,7 +190,6 @@ impl App {
         logs.push_back(format!("⇝ Mounted {}", graph.root_label()));
         logs.push_back("⇝ LMB select/drag · MMB/WASD/arrows pan · Home center".to_string());
         logs.push_back("⇝ Tab changes menu segment · 0..9 runs local segment item".to_string());
-        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
         logs.push_back("⇝ Esc hides TUI · vmx_tui reopens · Ctrl-Q exits app".to_string());
         Ok(Self {
             graph,
@@ -381,12 +380,10 @@ fn run_terminal_session(
     }
 }
 
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
 fn terminal_lease_io(error: trueos::vshell::TerminalLeaseError) -> io::Error {
     io::Error::new(io::ErrorKind::Other, error.to_string())
 }
 
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
 fn trueos_main() -> io::Result<()> {
     let config = Config::from_args();
     let mut app = App::new(config)?;
@@ -413,23 +410,8 @@ fn trueos_main() -> io::Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
-fn native_main() -> io::Result<()> {
-    let config = Config::from_args();
-    let mut app = App::new(config)?;
-    run_terminal_session(&mut app, || Ok(()))
-}
-
 pub fn run() -> io::Result<()> {
-    #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-    {
-        trueos_main()
-    }
-
-    #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
-    {
-        native_main()
-    }
+    trueos_main()
 }
 
 fn handle_event(app: &mut App, event: Event) -> io::Result<()> {

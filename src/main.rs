@@ -14,7 +14,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
 use std::io::Write;
 
 use actions::{
@@ -77,13 +76,10 @@ impl Config {
             })
             .unwrap_or(false);
 
-        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
         let (mut initial_path, initial_depth) = {
             let directives = launch_directives();
             (directives.browse_path, directives.depth)
         };
-        #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
-        let (mut initial_path, initial_depth) = (None, None);
         let mut browse_value = false;
 
         for arg in env::args().skip(1) {
@@ -122,7 +118,6 @@ struct LaunchDirectives {
     depth: Option<usize>,
 }
 
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
 fn launch_directives() -> LaunchDirectives {
     let Ok(bytes) = trueos::async_fs::block_on(trueos::async_fs::read_file(b"vFile:launch")) else {
         return LaunchDirectives::default();
@@ -212,7 +207,6 @@ mod launch_script_tests {
     }
 }
 
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
 fn available_mounts(_graph: &GraphView) -> Vec<MountLink> {
     trueos::async_fs::block_on(trueos::async_fs::list_mounts())
         .unwrap_or_default()
@@ -224,16 +218,6 @@ fn available_mounts(_graph: &GraphView) -> Vec<MountLink> {
             read_only: mount.read_only,
         })
         .collect()
-}
-
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
-fn available_mounts(graph: &GraphView) -> Vec<MountLink> {
-    vec![MountLink {
-        path: graph.root_path().to_path_buf(),
-        label: "current".to_string(),
-        primary: true,
-        read_only: false,
-    }]
 }
 
 struct TerminalGuard {
@@ -363,7 +347,6 @@ impl App {
         logs.push_back(format!("⇝ {} filesystem root mount(s)", mounts.len()));
         logs.push_back("⇝ LMB select/drag · MMB/WASD/arrows pan · Home center".to_string());
         logs.push_back("⇝ Tab changes menu segment · 0..9 runs local segment item".to_string());
-        #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
         logs.push_back("⇝ Esc hides TUI · tui reopens · Ctrl-Q exits app".to_string());
         Ok(Self {
             graph,
@@ -535,7 +518,6 @@ fn run_terminal_session(
                 // position once instead of every intermediate position.
                 for batch_index in 0..MAX_EVENT_BATCH {
                     let terminal_event = event::read()?;
-                    #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
                     match &terminal_event {
                         Event::Key(_) => {
                             let _ = trueos::logl::log_record(
@@ -576,13 +558,11 @@ fn run_terminal_session(
     }
 }
 
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
 fn terminal_lease_io(error: trueos::vshell::TerminalLeaseError) -> io::Error {
     io::Error::new(io::ErrorKind::Other, error.to_string())
 }
 
-#[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-fn trueos_main() -> io::Result<()> {
+fn main() -> io::Result<()> {
     // Bare-metal input requires the terminal lease to establish the terminal
     // route before the full application performs its VFS-backed initialization.
     // Keep the claim rollback explicit so an initialization error still returns
@@ -620,29 +600,9 @@ fn trueos_main() -> io::Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
-fn native_main() -> io::Result<()> {
-    let config = Config::from_args();
-    let mut app = App::new(config)?;
-    run_terminal_session(&mut app, || Ok(()))
-}
-
-fn main() -> io::Result<()> {
-    #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-    {
-        trueos_main()
-    }
-
-    #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
-    {
-        native_main()
-    }
-}
-
 fn handle_event(app: &mut App, event: Event) -> io::Result<()> {
     match event {
         Event::Resize(columns, rows) => {
-            #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
             if rows <= 12 {
                 let _ = trueos::logl::log_record(
                     trueos::logl::level::INFO,
@@ -1291,20 +1251,13 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
 }
 
 fn cycle_terminal_zoom(app: &mut App) -> io::Result<()> {
-    #[cfg(any(target_os = "trueos", target_os = "zkvm"))]
-    {
-        let next = (app.zoom_step + 1) % ZOOM_LEVELS.len();
-        let percent = ZOOM_LEVELS[next];
-        let mut output = stdout().lock();
-        write!(output, "\x1b]777;terminal_zoom={percent}\x07")?;
-        output.flush()?;
-        app.zoom_step = next;
-        app.log(format!("VIEW · zoom {percent}%"));
-    }
-    #[cfg(not(any(target_os = "trueos", target_os = "zkvm")))]
-    {
-        app.log("VIEW · zoom is controlled by the host terminal");
-    }
+    let next = (app.zoom_step + 1) % ZOOM_LEVELS.len();
+    let percent = ZOOM_LEVELS[next];
+    let mut output = stdout().lock();
+    write!(output, "\x1b]777;terminal_zoom={percent}\x07")?;
+    output.flush()?;
+    app.zoom_step = next;
+    app.log(format!("VIEW · zoom {percent}%"));
     Ok(())
 }
 
