@@ -144,17 +144,18 @@ impl Minimap {
         frame.fill_rect(g.x, g.y, g.width, g.height, ' ', style);
 
         if g.width >= 2 {
-            frame.put(g.x, g.y, '╔', style);
-            frame.put(g.x + g.width - 1, g.y, '╗', style);
-            frame.put(g.x, g.y + g.height - 1, '╚', style);
-            frame.put(g.x + g.width - 1, g.y + g.height - 1, '╝', style);
+            frame.put(g.x, g.y, '╒', style);
+            frame.put(g.x + g.width - 1, g.y, '╕', style);
+            frame.put(g.x, g.y + g.height - 1, '╘', style);
+            frame.put(g.x + g.width - 1, g.y + g.height - 1, '╛', style);
             for x in g.x + 1..g.x + g.width - 1 {
                 frame.put(x, g.y, '═', style);
                 frame.put(x, g.y + g.height - 1, '═', style);
             }
 
-            // Compact fixed title inside the double-line top border.
-            const TITLE: &str = "ᗰAP";
+            // Fixed title connected to the double horizontal rule, with the
+            // same mixed single/double frame vocabulary as confirmation boxes.
+            const TITLE: &str = "╡ M A P ╞";
             let title_width = TITLE.chars().count() as u16;
             if g.width >= title_width.saturating_add(4) {
                 let title_x = g.x + (g.width.saturating_sub(title_width)) / 2;
@@ -164,8 +165,8 @@ impl Minimap {
             }
         }
         for y in g.y + 1..g.y + g.height - 1 {
-            frame.put(g.x, y, '║', style);
-            frame.put(g.x + g.width - 1, y, '║', style);
+            frame.put(g.x, y, '│', style);
+            frame.put(g.x + g.width - 1, y, '│', style);
         }
 
         let Some(cache) = self.cache.as_ref() else {

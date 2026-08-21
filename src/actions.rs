@@ -890,7 +890,7 @@ pub fn draw_modal(frame: &mut Frame, modal: &Modal, viewport: Viewport) {
         modal_style,
     );
 
-    let notch_width = notch.chars().count().saturating_sub(2).max(4);
+    let notch_width = notch.chars().count().max(4);
     let cap = format!("╚{}╝", "═".repeat(notch_width.saturating_sub(2)));
     let cap_space = inner.saturating_sub(cap.chars().count());
     let cap_left = cap_space / 2;

@@ -1168,7 +1168,7 @@ struct BreadcrumbLayout {
 }
 
 fn map_toggle_hit(x: u16, y: u16) -> bool {
-    y == 0 && x < terminal_cell_width('🗺') as u16
+    y == 0 && x < text_cell_width("🗺  ") as u16
 }
 
 fn draw_top_rule(frame: &mut Frame, app: &App, menu_x: u16) {
