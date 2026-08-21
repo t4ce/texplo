@@ -18,11 +18,20 @@
 }
 
 
+### to get latest version
 # nix run --refresh github:GlassGhost/texplo
-# or
+
+### or if you have the latest version
+# nix run github:GlassGhost/texplo
+
+### or if you want to submit a patch
 # git clone https://github.com/GlassGhost/texplo
 # cd ./texplo
-# nix run
+### edit the code
 # nix build
+# nix run
+### when you're happy with your patch
+### COMMIT BEFORE YOU
 # ./make-flake.sh
+### Also after make-flake update cargo hashes etc. with
 # ./upd8cargo.sh
