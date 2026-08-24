@@ -1,4 +1,4 @@
-use crate::chronos::{Duration, SystemTime, elapsed_since};
+use crate::chronos::{elapsed_since, Duration, SystemTime};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     layout::{self, LayoutMode, LayoutNode, WorldPos},
-    screen::{Frame, Style, terminal_cell_width, text_cell_width},
+    screen::{terminal_cell_width, text_cell_width, Frame, Style},
 };
 
 const HARD_MAX_DEPTH: usize = 256;
@@ -151,6 +151,7 @@ pub struct FsNode {
     pub is_dir: bool,
     pub is_placeholder: bool,
     pub is_removed: bool,
+    pub is_moved: bool,
     hidden: bool,
     depth: usize,
 }
@@ -262,6 +263,7 @@ impl GraphView {
             is_dir: true,
             is_placeholder: false,
             is_removed: false,
+            is_moved: false,
             hidden: false,
             depth: 0,
         });
@@ -291,7 +293,7 @@ impl GraphView {
             .node(id)
             .cloned()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "folder disappeared"))?;
-        if node.is_placeholder || node.is_removed || node.hidden || !node.is_dir {
+        if node.is_placeholder || node.is_removed || node.is_moved || node.hidden || !node.is_dir {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a folder"));
         }
         self.mount_path(&node.path)
@@ -316,7 +318,11 @@ impl GraphView {
         self.nodes
             .iter()
             .find(|node| {
-                !node.is_placeholder && !node.is_removed && !node.hidden && node.path == path
+                !node.is_placeholder
+                    && !node.is_removed
+                    && !node.is_moved
+                    && !node.hidden
+                    && node.path == path
             })
             .map(|node| node.id)
     }
@@ -377,6 +383,7 @@ impl GraphView {
                 is_dir,
                 is_placeholder: false,
                 is_removed: false,
+                is_moved: false,
                 hidden: false,
                 depth,
             });
@@ -447,6 +454,7 @@ impl GraphView {
             is_dir: false,
             is_placeholder: true,
             is_removed: false,
+            is_moved: false,
             hidden: false,
             depth,
         });
@@ -772,7 +780,7 @@ impl GraphView {
         let mut samples = Vec::with_capacity(self.nodes.len().saturating_mul(4));
 
         for node in &self.nodes {
-            if node.id == 0 || node.hidden || node.is_removed {
+            if node.id == 0 || node.hidden || node.is_removed || node.is_moved {
                 continue;
             }
             let Some(pos) = self.positions.get(node.id).copied() else {
@@ -799,7 +807,7 @@ impl GraphView {
             let Some(parent) = self.node(parent_id) else {
                 continue;
             };
-            if parent.hidden || parent.is_removed {
+            if parent.hidden || parent.is_removed || parent.is_moved {
                 continue;
             }
             let Some(parent_pos) = self.positions.get(parent_id).copied() else {
@@ -828,7 +836,7 @@ impl GraphView {
 
     pub fn selection_stats(&self, id: usize) -> Option<SelectionStats> {
         let node = self.node(id)?;
-        if node.id == 0 || node.is_placeholder || node.is_removed || node.hidden {
+        if node.id == 0 || node.is_placeholder || node.is_removed || node.is_moved || node.hidden {
             return None;
         }
 
@@ -861,7 +869,7 @@ impl GraphView {
         let node = self.node(id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "selected file no longer exists")
         })?;
-        if node.is_placeholder || node.is_removed || node.hidden || node.is_dir {
+        if node.is_placeholder || node.is_removed || node.is_moved || node.hidden || node.is_dir {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "select one regular file",
@@ -880,7 +888,7 @@ impl GraphView {
         let node = self.node(id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "selected item no longer exists")
         })?;
-        if node.is_placeholder || node.is_removed || node.hidden {
+        if node.is_placeholder || node.is_removed || node.is_moved || node.hidden {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "select one file or folder",
@@ -953,6 +961,8 @@ impl GraphView {
                     String::new()
                 } else if n.is_removed {
                     "🪦 removed".to_string()
+                } else if n.is_moved {
+                    "moved".to_string()
                 } else if n.is_placeholder {
                     "...".to_string()
                 } else {
@@ -969,7 +979,12 @@ impl GraphView {
         }
 
         for node in self.nodes.iter().rev() {
-            if node.id == 0 || node.is_placeholder || node.is_removed || node.hidden {
+            if node.id == 0
+                || node.is_placeholder
+                || node.is_removed
+                || node.is_moved
+                || node.hidden
+            {
                 continue;
             }
             let Some((sx, sy)) = self.screen_pos(node.id, viewport) else {
@@ -1033,7 +1048,9 @@ impl GraphView {
         if src.is_placeholder
             || dst.is_placeholder
             || src.is_removed
+            || src.is_moved
             || dst.is_removed
+            || dst.is_moved
             || src.hidden
             || dst.hidden
             || !dst.is_dir
@@ -1054,7 +1071,12 @@ impl GraphView {
         let Some(src) = self.node(source) else {
             return false;
         };
-        if src.is_placeholder || src.is_removed || src.hidden || src.path.parent() == Some(target) {
+        if src.is_placeholder
+            || src.is_removed
+            || src.is_moved
+            || src.hidden
+            || src.path.parent() == Some(target)
+        {
             return false;
         }
         if target == src.path || (src.is_dir && target.starts_with(&src.path)) {
@@ -1114,7 +1136,12 @@ impl GraphView {
             let node = self.node(parent).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "parent folder disappeared")
             })?;
-            if node.is_placeholder || node.is_removed || node.hidden || !node.is_dir {
+            if node.is_placeholder
+                || node.is_removed
+                || node.is_moved
+                || node.hidden
+                || !node.is_dir
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "parent is not a folder",
@@ -1205,8 +1232,8 @@ impl GraphView {
         }
 
         trueos_rename(&src.path, &destination)?;
+        self.mark_moved(source);
         let message = format!("MOVE · {} → {}", src.name, dst.name);
-        self.reload()?;
         Ok(message)
     }
 
@@ -1234,8 +1261,8 @@ impl GraphView {
         }
 
         trueos_rename(&src.path, &destination)?;
+        self.mark_moved(source);
         let message = format!("MOVE · {} → {}", src.name, target.display());
-        self.reload()?;
         Ok(message)
     }
 
@@ -1307,6 +1334,19 @@ impl GraphView {
         Ok(message)
     }
 
+    // Keep the old node in its existing slot as a lightweight move marker until
+    // the next explicit reload. This mirrors delete's retained tombstone update:
+    // no directory scan or layout pass is needed, only the affected subtree and
+    // connector cache change.
+    fn mark_moved(&mut self, source: usize) {
+        if let Some(node) = self.nodes.get_mut(source) {
+            node.is_moved = true;
+        }
+        self.hide_descendants(source);
+        self.rebuild_edge_cache();
+        self.bump_scene_revision();
+    }
+
     fn hide_descendants(&mut self, ancestor: usize) {
         let mut stack = vec![ancestor];
         while let Some(parent) = stack.pop() {
@@ -1352,7 +1392,7 @@ impl GraphView {
             let label = self.visual_label(node.id);
             let mut style = Style::new(Color::Grey, Color::Reset);
 
-            if node.is_removed {
+            if node.is_removed || node.is_moved {
                 style = Style::new(Color::DarkGrey, Color::Reset);
             } else if node.is_placeholder {
                 // Truncation must be visually loud enough to read as an actual
@@ -1361,13 +1401,13 @@ impl GraphView {
             } else if node.is_dir {
                 style = Style::new(Color::Black, Color::White);
             }
-            if !node.is_removed && selected == Some(node.id) {
+            if !node.is_removed && !node.is_moved && selected == Some(node.id) {
                 style = Style::new(Color::Black, Color::DarkYellow);
             }
-            if !node.is_removed && drop_target == Some(node.id) {
+            if !node.is_removed && !node.is_moved && drop_target == Some(node.id) {
                 style = Style::new(Color::Black, Color::Cyan);
             }
-            if !node.is_removed && drag_id == Some(node.id) {
+            if !node.is_removed && !node.is_moved && drag_id == Some(node.id) {
                 style = Style::new(Color::DarkGrey, Color::Reset);
             }
 
@@ -1440,6 +1480,8 @@ impl GraphView {
                     0
                 } else if node.is_removed {
                     text_cell_width("🪦 removed")
+                } else if node.is_moved {
+                    text_cell_width("moved")
                 } else if node.is_placeholder {
                     3
                 } else {

@@ -81,3 +81,9 @@ Delete behavior
 - The current graph is not rescanned or re-laid out.
 - The deleted entry stays at the same position as `🪦 removed` until the next reload/mount/parent/depth refresh.
 - Removed folder descendants are hidden immediately and are non-interactive.
+
+Move behavior
+-------------
+- Confirmed moves rename the item on disk without rescanning or re-laying out the current graph.
+- The old entry stays at the same position as `moved` until the next reload/mount/parent/depth refresh.
+- Moved folder descendants are hidden immediately and are non-interactive.
