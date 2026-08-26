@@ -506,6 +506,7 @@ impl MenuState {
 pub enum PendingAction {
     Move { source: usize, target: usize },
     MoveToPath { source: usize, target: PathBuf },
+    MovePath { source: PathBuf, target: PathBuf },
     Trash { source: usize },
     NewFolder { parent: usize },
     NewFile { parent: usize },
@@ -553,6 +554,26 @@ impl Modal {
             title: "Confirm".to_string(),
             lines: vec![
                 format!("Move {}", graph.label(source)),
+                format!("into {} ?", target.display()),
+            ],
+            mode: ModalMode::Confirm,
+            trash_origin_y: None,
+        }
+    }
+
+    pub fn move_path(source: PathBuf, target: PathBuf) -> Self {
+        let label = source
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source.display().to_string());
+        Self {
+            pending: PendingAction::MovePath {
+                source,
+                target: target.clone(),
+            },
+            title: "Confirm".to_string(),
+            lines: vec![
+                format!("Move {label}"),
                 format!("into {} ?", target.display()),
             ],
             mode: ModalMode::Confirm,
@@ -796,6 +817,13 @@ pub fn execute_modal(modal: Modal, graph: &mut GraphView) -> io::Result<ActionOu
         }
         PendingAction::MoveToPath { source, target } => {
             let status = graph.move_node_to_path(source, &target)?;
+            Ok(ActionOutcome {
+                status,
+                trashed_label: None,
+            })
+        }
+        PendingAction::MovePath { source, target } => {
+            let status = graph.move_path(&source, &target)?;
             Ok(ActionOutcome {
                 status,
                 trashed_label: None,

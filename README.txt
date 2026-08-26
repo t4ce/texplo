@@ -59,9 +59,11 @@ Controls
 - Select a file or folder and choose `7z 🗜` to pack it; selecting a `.7z`
   archive extracts it beside the archive using a collision-free output name
 - Drag into virtual columns 0, 1, or 2: confirm recycle move
-- Drag into the menu: add a session link (no filesystem move)
-- Click a folder link: mount it
-- Click a file link: mount its parent and select it when visible
+- Drag into the menu: add a session Clip link (no filesystem move)
+- Click and release a folder link: mount it
+- Click and release a file link: mount its parent and select it when visible
+- Drag a Clip link onto a folder or breadcrumb: confirm moving the linked item
+- Drag a Clip link out and release without a folder target: unpin it
 - Y/N or mouse: confirmation modal
 - Enter/Esc: accept/cancel text-input modal
 

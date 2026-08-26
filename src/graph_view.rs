@@ -1085,6 +1085,13 @@ impl GraphView {
         true
     }
 
+    pub fn can_move_path(&self, source: &Path, target: &Path) -> bool {
+        source.file_name().is_some()
+            && source.parent() != Some(target)
+            && source != target
+            && !target.starts_with(source)
+    }
+
     fn is_descendant(&self, candidate: usize, ancestor: usize) -> bool {
         let mut current = self.node(candidate).and_then(|n| n.parent);
         while let Some(id) = current {
@@ -1264,6 +1271,46 @@ impl GraphView {
         self.mark_moved(source);
         let message = format!("MOVE · {} → {}", src.name, target.display());
         Ok(message)
+    }
+
+    pub fn move_path(&mut self, source: &Path, target: &Path) -> io::Result<String> {
+        if !self.can_move_path(source, target) || !trueos_is_dir(target)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid folder move",
+            ));
+        }
+        if !trueos_exists(source)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "linked source disappeared",
+            ));
+        }
+
+        let name = source.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "source has no file name")
+        })?;
+        let destination = target.join(name);
+        if trueos_exists(&destination)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already exists in {}",
+                    name.to_string_lossy(),
+                    target.display()
+                ),
+            ));
+        }
+
+        trueos_rename(source, &destination)?;
+        if let Some(source_id) = self.find_node_by_path(source) {
+            self.mark_moved(source_id);
+        }
+        Ok(format!(
+            "MOVE · {} → {}",
+            name.to_string_lossy(),
+            target.display()
+        ))
     }
 
     pub fn trash_node(&mut self, source: usize) -> io::Result<String> {
