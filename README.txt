@@ -6,6 +6,8 @@ termdir is a fast terminal directory explorer. Its short command is `td`.
 This `otheros` branch carries the portable UI and filesystem behavior developed
 in the TRUEOS application while using crossterm and the host filesystem.
 
+The project is distributed under the BSD 2-Clause license. See `LICENSE`.
+
 Run from this directory:
 
     cargo run
@@ -80,3 +82,15 @@ Install the `td` command:
 Use `--refresh` after the branch changes:
 
     nix run --refresh github:t4ce/texplo/otheros
+
+Official Nixpkgs packaging
+--------------------------
+The repository flake is the upstream build. A Nixpkgs package should use the
+release tag, install the `td` binary, and set `meta.mainProgram = "td"`.
+After termdir is accepted into Nixpkgs, the shorter commands will be:
+
+    nix run nixpkgs#termdir
+    nix profile install nixpkgs#termdir
+
+These commands are documented here for the packaging target; until the Nixpkgs
+change is merged, use the GitHub commands above.
