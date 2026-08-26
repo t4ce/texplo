@@ -1,5 +1,7 @@
-explorer_tui_v13
-================
+TerminalDirectoryExplorer
+=========================
+
+TDE is the fast terminal directory explorer for TRUEOS.
 
 Run from this directory:
 
@@ -30,7 +32,7 @@ Initial path
 
   `fs-scope trueosfs` is a host-side capability grant. Without it, the standard
   v filesystem API keeps mapping paths to the app root plus `/common`, and
-  `browse /` means the app root. With it, Texplo can enumerate every mounted
+  `browse /` means the app root. With it, TDE can enumerate every mounted
   TRUEOSFS root and shows those roots at the top of the Mount menu. `★` marks
   the primary root and `◇` marks a read-only root. Root selectors have the form
   `trueosfs:discN`.
