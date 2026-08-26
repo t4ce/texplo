@@ -1293,13 +1293,7 @@ fn minimap_geometry(app: &App, layout: Layout) -> Option<minimap::MinimapGeometr
         return None;
     }
     let (width, height) = terminal::size().ok()?;
-    Minimap::geometry(
-        width,
-        height,
-        layout.viewport,
-        MIN_WIDTH,
-        Layout::minimum_height(app.diagnostics),
-    )
+    Minimap::geometry(width, height, layout.viewport)
 }
 
 fn minimap_hit(app: &App, layout: Layout, x: u16, y: u16) -> bool {
@@ -1620,13 +1614,7 @@ fn compose_frame(app: &mut App) -> io::Result<Frame> {
     );
 
     if app.minimap_visible {
-        app.minimap.draw(
-            &mut frame,
-            &app.graph,
-            layout.viewport,
-            MIN_WIDTH,
-            Layout::minimum_height(app.diagnostics),
-        );
+        app.minimap.draw(&mut frame, &app.graph, layout.viewport);
     }
 
     if let Some(drag) = app.drag {
