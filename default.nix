@@ -45,13 +45,13 @@ rustPlatform.buildRustPackage rec {
 }
 
 ### to get latest version
-# nix run --refresh github:GlassGhost/texplo
+# nix run --refresh github:t4ce/texplo/otheros
 
 ### or if you have the latest version
-# nix run github:GlassGhost/texplo
+# nix run github:t4ce/texplo/otheros
 
 ### or if you want to submit a patch
-# git clone https://github.com/GlassGhost/texplo
+# git clone --branch otheros https://github.com/t4ce/texplo
 # cd ./texplo
 ### edit the code
 # nix build
