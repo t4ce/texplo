@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/termdir-logo.png" alt="termdir logo" width="360">
+  <img src="assets/logo.png" alt="termdir logo" width="360">
 </p>
 
 termdir is a fast terminal directory explorer. Its short command is `td`.
