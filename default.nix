@@ -13,7 +13,7 @@
 # stdenv.mkDerivation rec {
 # pkgs.
 rustPlatform.buildRustPackage rec {
-  pname = "texplo";
+  pname = "TerminalDirectoryExplorer";
   version = "X";
   # Points to the source code folder
   src = ./.;
@@ -35,12 +35,11 @@ rustPlatform.buildRustPackage rec {
   outputs = [ "out" ];
 
   meta = {
-    description = "Terminal based file browser in rust.";
-    homepage = "https://github.com/trociny/bmkdep";
+    description = "TerminalDirectoryExplorer (TDE) - a fast terminal file browser.";
+    homepage = "https://github.com/t4ce/texplo";
     license = lib.licenses.bsd2;
     platforms = lib.platforms.unix;
-    maintainers = [ lib.maintainers.GlassGhost ];
-    mainProgram = "explorer_tui_v14";
+    mainProgram = "tde";
   };
 }
 

@@ -92,13 +92,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "explorer_tui_v14"
-version = "0.14.0"
-dependencies = [
- "crossterm",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -273,6 +266,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "terminal-directory-explorer"
+version = "0.14.0"
+dependencies = [
+ "crossterm",
 ]
 
 [[package]]

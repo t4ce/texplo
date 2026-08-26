@@ -12,11 +12,11 @@ use crate::{
     screen::{terminal_cell_width, text_cell_width, Frame, Style},
 };
 
-const HARD_MAX_DEPTH: usize = 256;
+const HARD_MAX_DEPTH: usize = 1024;
 const DEPTH_LEVELS: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
 const DEFAULT_DEPTH_LIMIT: usize = 4;
-const MAX_CHILDREN_PER_DIR: usize = 256;
-const MAX_VISIBLE_NODES: usize = 256;
+const MAX_CHILDREN_PER_DIR: usize = 1024;
+const MAX_VISIBLE_NODES: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sha256Result {
@@ -419,7 +419,7 @@ impl GraphView {
 
         // Add immediate children first. In particular, the mount root gets all of
         // its visible top-level islands before any one subtree can consume the
-        // global 256-node rendering budget.
+        // global 1024-node rendering budget.
         let mut recurse = Vec::new();
         let mut globally_truncated = false;
         for (_, name, path, is_dir, is_symlink) in children {
@@ -1130,6 +1130,13 @@ impl GraphView {
         true
     }
 
+    pub fn can_move_path(&self, source: &Path, target: &Path) -> bool {
+        source.file_name().is_some()
+            && source.parent() != Some(target)
+            && source != target
+            && !target.starts_with(source)
+    }
+
     fn is_descendant(&self, candidate: usize, ancestor: usize) -> bool {
         let mut current = self.node(candidate).and_then(|n| n.parent);
         while let Some(id) = current {
@@ -1302,6 +1309,46 @@ impl GraphView {
         self.mark_moved(source);
         let message = format!("MOVE · {} → {}", src.name, target.display());
         Ok(message)
+    }
+
+    pub fn move_path(&mut self, source: &Path, target: &Path) -> io::Result<String> {
+        if !self.can_move_path(source, target) || !path_is_dir(target)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid folder move",
+            ));
+        }
+        if !path_exists(source)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "linked source disappeared",
+            ));
+        }
+
+        let name = source.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "source has no file name")
+        })?;
+        let destination = target.join(name);
+        if path_exists(&destination)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already exists in {}",
+                    name.to_string_lossy(),
+                    target.display()
+                ),
+            ));
+        }
+
+        fs::rename(source, &destination)?;
+        if let Some(source_id) = self.find_node_by_path(source) {
+            self.mark_moved(source_id);
+        }
+        Ok(format!(
+            "MOVE · {} → {}",
+            name.to_string_lossy(),
+            target.display()
+        ))
     }
 
     pub fn trash_node(&mut self, source: usize) -> io::Result<String> {
@@ -1915,6 +1962,34 @@ mod tests {
         assert_eq!(graph.find_node_by_path(&source), None);
         assert_eq!(fs::read(target.join("source.txt")).unwrap(), b"data");
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn linked_path_can_move_into_the_current_graph() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "texplo-linked-move-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let outside = root.join("outside");
+        let mounted = root.join("mounted");
+        let target = mounted.join("target");
+        let source = outside.join("clipped.txt");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(&source, b"clipped").unwrap();
+
+        let mut graph = GraphView::from_current_dir().unwrap();
+        graph.mount_path(&mounted).unwrap();
+        assert!(graph.can_move_path(&source, &target));
+        graph.move_path(&source, &target).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(target.join("clipped.txt")).unwrap(), b"clipped");
         fs::remove_dir_all(&root).unwrap();
     }
 }

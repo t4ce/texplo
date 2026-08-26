@@ -1,9 +1,9 @@
-Texplo
-======
+TerminalDirectoryExplorer
+=========================
 
-Terminal directory explorer for native hosts. This `otheros` branch carries the
-portable UI and filesystem behavior developed in the TRUEOS application while
-using crossterm and the host filesystem.
+TDE is a terminal directory explorer for native hosts. This `otheros` branch
+carries the portable UI and filesystem behavior developed in the TRUEOS
+application while using crossterm and the host filesystem.
 
 Run from this directory:
 
@@ -30,8 +30,10 @@ Controls
 - Drag onto a folder or breadcrumb: confirm move
 - Drag into virtual columns 0, 1, or 2: confirm recycle move
 - Drag into the menu: add a session Clip link
-- Click a folder link: mount it
-- Click a file link: mount its parent and select it
+- Click and release a folder link: mount it
+- Click and release a file link: mount its parent and select it
+- Drag a Clip link onto a folder or breadcrumb: confirm moving the linked item
+- Drag a Clip link out and release without a folder target: unpin it
 - Y/N or mouse: confirmation modal
 - Enter/Esc: accept/cancel text input
 - Ctrl+Q or Esc: exit
@@ -68,6 +70,11 @@ Nix
 ---
 
     nix run github:t4ce/texplo/otheros
+
+Install the `tde` command:
+
+    nix profile install github:t4ce/texplo/otheros
+    tde
 
 Use `--refresh` after the branch changes:
 

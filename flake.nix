@@ -1,5 +1,5 @@
 {
-  description = "Texplo - Terminal based file browser in rust.";
+  description = "TerminalDirectoryExplorer (TDE) - a fast terminal file browser.";
   inputs = {
     nixpkgs.url = "nixpkgs";
     flake-parts.url = "github:hercules-ci/flake-parts";

@@ -55,7 +55,8 @@ impl Minimap {
         }
 
         // One fifth in both axes preserves the terminal's own rectangle aspect.
-        // At the 2x UI threshold this still leaves a useful Braille interior.
+        // At the 2x reduced UI threshold this still leaves a useful Braille
+        // interior while making the map available 15% earlier than before.
         let width = (terminal_width / 5).max(8).min(viewport.width);
         let height = (terminal_height / 5).max(5).min(viewport.height);
         if width < 4 || height < 4 {

@@ -1,7 +1,11 @@
 [package]
-name = "explorer_tui_v14"
+name = "terminal-directory-explorer"
 version = "0.14.0"
 edition = "2021"
+
+[[bin]]
+name = "tde"
+path = "src/main.rs"
 
 [dependencies]
 crossterm = "0.29"

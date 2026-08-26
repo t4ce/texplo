@@ -50,7 +50,7 @@ impl Default for Style {
 pub fn terminal_cell_width(ch: char) -> u16 {
     match ch {
         // Shell2's terminal treats the Japanese middle dot as wide. It is
-        // used in Texplo's slash-free breadcrumbs and title delimiters, so it
+        // used in TDE's slash-free breadcrumbs and title delimiters, so it
         // must occupy the same two cells in retained frames and hit layouts.
         '🪦' | '☰' | 'Ｎ' | 'Ｕ' | '＃' | '・' => 2,
         _ => 1,
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn presents_a_small_frame_in_one_buffered_write() {
         let mut frame = Frame::new(8, 1);
-        frame.put_str(0, 0, "texplo", Style::default());
+        frame.put_str(0, 0, "tde", Style::default());
 
         let mut renderer = Renderer::default();
         let mut output = BufWriter::with_capacity(64 * 1024, RecordingWriter::default());
@@ -452,7 +452,7 @@ mod tests {
 
         let output = output.into_inner().unwrap();
         assert_eq!(output.writes, 1);
-        assert!(output.bytes.windows(6).any(|window| window == b"texplo"));
+        assert!(output.bytes.windows(3).any(|window| window == b"tde"));
     }
 
     #[test]

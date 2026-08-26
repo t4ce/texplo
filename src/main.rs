@@ -22,8 +22,8 @@ use actions::{
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     style::{Color, ResetColor},
@@ -40,13 +40,16 @@ const FRAME_X: u16 = 2;
 const CANVAS_X: u16 = FRAME_X + 1;
 const MENU_WIDTH: u16 = 17;
 const LOG_ROWS: u16 = 6;
-const MIN_WIDTH: u16 = 60;
-const MIN_CONTENT_HEIGHT: u16 = 27;
+// Allow the interface to engage 15% earlier than the original 60x27 design
+// floor. Below this reduced floor compose_frame keeps rendering only the
+// compact "terminal too small" notice.
+const MIN_WIDTH: u16 = 51;
+const MIN_CONTENT_HEIGHT: u16 = 23;
 const TICK: Duration = Duration::from_millis(16);
 const MAX_EVENT_BATCH: usize = 64;
 const FRAME_OUTPUT_BUFFER_CAPACITY: usize = 64 * 1024;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(70);
-const BUILD_ID: &str = "v0.26 · pinned tde + middle-dot paths";
+const BUILD_ID: &str = "TDE · v0.26 · pinned paths";
 const FALL_TICK: Duration = Duration::from_millis(90);
 const ZOOM_LEVELS: [u16; 5] = [75, 100, 125, 150, 200];
 const DEFAULT_ZOOM_STEP: usize = 1;
@@ -313,6 +316,7 @@ impl TerminalGuard {
             stdout(),
             EnterAlternateScreen,
             DisableLineWrap,
+            EnableBracketedPaste,
             EnableMouseCapture,
             Hide
         ) {
@@ -321,6 +325,7 @@ impl TerminalGuard {
                 ResetColor,
                 Show,
                 DisableMouseCapture,
+                DisableBracketedPaste,
                 EnableLineWrap,
                 LeaveAlternateScreen
             );
@@ -341,6 +346,7 @@ impl TerminalGuard {
             ResetColor,
             Show,
             DisableMouseCapture,
+            DisableBracketedPaste,
             EnableLineWrap,
             LeaveAlternateScreen
         );
@@ -374,6 +380,28 @@ struct DragState {
 }
 
 #[derive(Clone, Copy)]
+struct ClipPress {
+    index: usize,
+    start_x: u16,
+    start_y: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClipDragState {
+    index: usize,
+    x: u16,
+    y: u16,
+    target: Option<PathBuf>,
+    over_clip: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PendingClipMove {
+    source: PathBuf,
+    target: PathBuf,
+}
+
+#[derive(Clone, Copy)]
 struct PanState {
     start_x: u16,
     start_y: u16,
@@ -395,6 +423,9 @@ struct App {
     path_hover: Option<PathBuf>,
     press: Option<Press>,
     drag: Option<DragState>,
+    clip_press: Option<ClipPress>,
+    clip_drag: Option<ClipDragState>,
+    pending_clip_move: Option<PendingClipMove>,
     pan: Option<PanState>,
     minimap_nav: bool,
     menu: MenuState,
@@ -438,6 +469,9 @@ impl App {
             path_hover: None,
             press: None,
             drag: None,
+            clip_press: None,
+            clip_drag: None,
+            pending_clip_move: None,
             pan: None,
             minimap_nav: false,
             menu: MenuState::default(),
@@ -513,6 +547,8 @@ impl App {
     fn clear_transient(&mut self) {
         self.press = None;
         self.drag = None;
+        self.clip_press = None;
+        self.clip_drag = None;
         self.pan = None;
         self.minimap_nav = false;
     }
@@ -591,6 +627,13 @@ fn run_terminal_session(
 
     let session_result = (|| {
         loop {
+            // Exit events may arrive in the same coalesced batch as mouse
+            // movement that marked the scene dirty. Never pay for one final
+            // graph layout/render after the user has already asked to leave.
+            if app.should_exit {
+                break;
+            }
+
             let now = Instant::now();
             app.update_resize(now);
             update_animation(app, now);
@@ -604,10 +647,6 @@ fn run_terminal_session(
                     first_frame = false;
                 }
             }
-            if app.should_exit {
-                break;
-            }
-
             if event::poll(TICK)? {
                 // Coalesce a bounded burst before repainting. Drag and key-repeat
                 // events often arrive in clusters; this renders the newest camera
@@ -650,6 +689,10 @@ fn handle_event(app: &mut App, event: Event) -> io::Result<()> {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             handle_key(app, key.code, key.modifiers)?
         }
+        // Middle-click paste must never be interpreted as menu hotkeys. With
+        // bracketed paste enabled, terminals deliver the entire payload here
+        // instead of synthesizing a stream of ordinary key presses.
+        Event::Paste(_) => {}
         Event::Mouse(mouse) => handle_mouse(app, mouse)?,
         _ => {}
     }
@@ -915,7 +958,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                 }
                 return Ok(());
             }
-            MouseEventKind::Up(_) => {
+            MouseEventKind::Up(MouseButton::Left) => {
                 app.minimap_nav = false;
                 return Ok(());
             }
@@ -925,7 +968,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
 
     if let Some(pan) = app.pan {
         match mouse.kind {
-            MouseEventKind::Drag(_) => {
+            MouseEventKind::Drag(MouseButton::Middle) => {
                 let dx = mouse.column as i32 - pan.start_x as i32;
                 let dy = mouse.row as i32 - pan.start_y as i32;
                 let next = (pan.camera_x + dx * 2, pan.camera_y + dy * 2);
@@ -937,7 +980,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                 }
                 return Ok(());
             }
-            MouseEventKind::Up(_) => {
+            MouseEventKind::Up(MouseButton::Middle) => {
                 app.pan = None;
                 return Ok(());
             }
@@ -945,7 +988,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         }
     }
 
-    if mouse.column >= layout.menu_x
+    if handle_clip_gesture(app, mouse, layout)? {
+        return Ok(());
+    }
+
+    if matches!(
+        mouse.kind,
+        MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left)
+    ) && mouse.column >= layout.menu_x
         && app.press.is_none()
         && app.drag.is_none()
         && app.pan.is_none()
@@ -987,7 +1037,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                 app.mark_dirty();
             }
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                open_link(app, link_index)?;
+                app.clip_press = Some(ClipPress {
+                    index: link_index,
+                    start_x: mouse.column,
+                    start_y: mouse.row,
+                });
             }
         }
         return Ok(());
@@ -1091,7 +1145,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                 }
             }
         }
-        MouseEventKind::Up(_) => {
+        MouseEventKind::Up(MouseButton::Left) => {
             if let Some(drag) = app.drag.take() {
                 let path_target = (mouse.row == 0)
                     .then(|| breadcrumb_drop_target_at(app, layout, mouse.column, drag.node))
@@ -1125,6 +1179,108 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn handle_clip_gesture(app: &mut App, mouse: MouseEvent, layout: Layout) -> io::Result<bool> {
+    let Some(press) = app.clip_press else {
+        return Ok(false);
+    };
+
+    match mouse.kind {
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let moved = mouse.column.abs_diff(press.start_x) + mouse.row.abs_diff(press.start_y);
+            if moved == 0 {
+                return Ok(true);
+            }
+            let Some(link) = app.links.get(press.index).cloned() else {
+                app.clip_press = None;
+                app.clip_drag = None;
+                return Ok(true);
+            };
+            let target = clip_drop_target_at(app, layout, mouse.column, mouse.row, &link.path);
+            app.set_path_hover((mouse.row == 0).then(|| target.clone()).flatten());
+            let next = ClipDragState {
+                index: press.index,
+                x: mouse.column,
+                y: mouse.row,
+                target,
+                over_clip: clip_area_hit(app, layout, mouse.column, mouse.row),
+            };
+            if app.clip_drag.as_ref() != Some(&next) {
+                app.clip_drag = Some(next);
+                app.mark_dirty();
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.clip_press = None;
+            if let Some(mut drag) = app.clip_drag.take() {
+                let Some(link) = app.links.get(drag.index).cloned() else {
+                    app.set_path_hover(None);
+                    app.mark_dirty();
+                    return Ok(true);
+                };
+                drag.target = clip_drop_target_at(app, layout, mouse.column, mouse.row, &link.path);
+                drag.over_clip = clip_area_hit(app, layout, mouse.column, mouse.row);
+                if let Some(target) = drag.target {
+                    app.pending_clip_move = Some(PendingClipMove {
+                        source: link.path.clone(),
+                        target: target.clone(),
+                    });
+                    app.modal = Some(Modal::move_path(link.path, target));
+                    app.mark_dirty();
+                } else if !drag.over_clip {
+                    let removed = app.links.remove(drag.index);
+                    app.menu.set_clip_cursor(
+                        drag.index.min(app.links.len().saturating_sub(1)),
+                        app.links.len(),
+                    );
+                    app.log(format!("UNLINK · {}", removed.path.display()));
+                } else {
+                    app.mark_dirty();
+                }
+            } else {
+                open_link(app, press.index)?;
+            }
+            app.set_path_hover(None);
+        }
+        _ => {}
+    }
+    Ok(true)
+}
+
+fn clip_area_hit(app: &App, layout: Layout, x: u16, y: u16) -> bool {
+    if x < layout.menu_x || y > layout.separator_y {
+        return false;
+    }
+    let context = app.menu_context();
+    let mount_count = app.mounts.len().saturating_add(1);
+    MenuState::clip_header_row(layout.separator_y, context, mount_count, app.links.len())
+        .map(|header| y >= header)
+        .unwrap_or(false)
+}
+
+fn clip_drop_target_at(
+    app: &App,
+    layout: Layout,
+    x: u16,
+    y: u16,
+    source: &Path,
+) -> Option<PathBuf> {
+    if x >= layout.menu_x || is_trash_column(x) || minimap_hit(app, layout, x, y) {
+        return None;
+    }
+    if y == 0 {
+        let map_width = text_cell_width("🗺  ") as u16;
+        let crumbs = breadcrumb_layout(app.graph.root_path(), map_width, layout.menu_x)?;
+        return breadcrumb_path_at(&crumbs, x, true)
+            .filter(|target| app.graph.can_move_path(source, target));
+    }
+    if !layout.viewport.contains(x, y) {
+        return None;
+    }
+    let target = app.graph.hit_test(layout.viewport, x, y)?;
+    let node = app.graph.node(target)?;
+    (node.is_dir && app.graph.can_move_path(source, &node.path)).then(|| node.path.clone())
 }
 
 fn is_trash_column(x: u16) -> bool {
@@ -1313,6 +1469,7 @@ fn confirm_modal(app: &mut App, yes: bool) -> io::Result<()> {
     };
 
     if !yes {
+        app.pending_clip_move = None;
         app.log(if modal.is_input() {
             "INPUT · cancelled"
         } else {
@@ -1339,9 +1496,22 @@ fn confirm_modal(app: &mut App, yes: bool) -> io::Result<()> {
             .map(|node| (if node.is_dir { "🖿" } else { "🖹" }, modal.trash_origin_y)),
         _ => None,
     };
+    let pending_clip_move = app.pending_clip_move.take();
 
     match execute_modal(modal, &mut app.graph) {
         Ok(outcome) => {
+            if let Some(clip_move) = pending_clip_move {
+                if let Some(name) = clip_move.source.file_name() {
+                    let destination = clip_move.target.join(name);
+                    if let Some(link) = app
+                        .links
+                        .iter_mut()
+                        .find(|link| link.path == clip_move.source)
+                    {
+                        link.path = destination;
+                    }
+                }
+            }
             app.set_selected(None);
             app.clear_transient();
             app.log(outcome.status);
@@ -1434,7 +1604,12 @@ fn compose_frame(app: &mut App) -> io::Result<Frame> {
     draw_dropzone(&mut frame, app, layout);
 
     let drag_id = app.drag.map(|drag| drag.node);
-    let drop_target = app.drag.and_then(|drag| drag.target);
+    let drop_target = app.drag.and_then(|drag| drag.target).or_else(|| {
+        app.clip_drag
+            .as_ref()
+            .and_then(|drag| drag.target.as_deref())
+            .and_then(|path| app.graph.find_node_by_path(path))
+    });
     app.graph.render(
         &mut frame,
         layout.viewport,
@@ -1455,6 +1630,9 @@ fn compose_frame(app: &mut App) -> io::Result<Frame> {
 
     if let Some(drag) = app.drag {
         draw_drag_box(&mut frame, app, drag, layout);
+    }
+    if let Some(drag) = app.clip_drag.as_ref() {
+        draw_clip_drag_box(&mut frame, app, drag, layout);
     }
     if let Some(falling) = &app.falling {
         draw_falling(&mut frame, falling, layout);
@@ -1755,19 +1933,47 @@ fn draw_drag_box(frame: &mut Frame, app: &App, drag: DragState, layout: Layout) 
         return;
     };
 
-    let icon = if node.is_dir { "🖿" } else { "🖹" };
-    let name = node.name.clone();
+    draw_named_drag_box(
+        frame,
+        drag.x,
+        drag.y,
+        node.name.as_str(),
+        node.is_dir,
+        layout,
+    );
+}
+
+fn draw_clip_drag_box(frame: &mut Frame, app: &App, drag: &ClipDragState, layout: Layout) {
+    let Some(link) = app.links.get(drag.index) else {
+        return;
+    };
+    let name = link
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| link.path.display().to_string());
+    draw_named_drag_box(frame, drag.x, drag.y, &name, link.is_dir, layout);
+}
+
+fn draw_named_drag_box(
+    frame: &mut Frame,
+    drag_x: u16,
+    drag_y: u16,
+    name: &str,
+    is_dir: bool,
+    layout: Layout,
+) {
+    let icon = if is_dir { "🖿" } else { "🖹" };
     let inner = name.chars().count().clamp(4, 18);
-    let visible = clip_text(&name, inner);
+    let visible = clip_text(name, inner);
     let box_width = inner + 2;
 
-    let mut x = drag.x.saturating_add(1);
+    let mut x = drag_x.saturating_add(1);
     if x + box_width as u16 >= layout.menu_x {
-        x = drag.x.saturating_sub(box_width as u16);
+        x = drag_x.saturating_sub(box_width as u16);
     }
     x = x.max(CANVAS_X);
-    let y = drag
-        .y
+    let y = drag_y
         .saturating_add(1)
         .min(layout.canvas_bottom_y.saturating_sub(2));
 
