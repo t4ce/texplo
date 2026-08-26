@@ -1,51 +1,64 @@
 mod actions;
 mod graph_view;
 mod layout;
+mod menu_view;
+mod minimap;
 mod screen;
 
 use std::{
     collections::VecDeque,
     env,
-    io::{self, stdout},
+    io::{self, stdout, BufWriter},
+    path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
 
+use std::io::Write;
+
 use actions::{
-    dispatch_menu, draw_menu, draw_modal, execute_modal, link_index_for_row, modal_click,
-    Dispatch, MenuContext, MenuLink, MenuState, Modal, PendingAction, MENU_ENTRIES,
+    dispatch_menu, draw_modal, execute_modal, modal_click, Dispatch, MenuContext, MenuLink,
+    MenuSection, MenuState, Modal, MountLink, PendingAction, MENU_ENTRIES,
 };
 use crossterm::{
     cursor::{Hide, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-        MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     style::{Color, ResetColor},
-    terminal::{
-        self, DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen,
-    },
+    terminal::{self, DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use graph_view::{GraphView, Viewport};
-use screen::{Frame, Renderer, Style};
+use graph_view::{GraphView, SelectionStats, Sha256Result, Viewport};
+use menu_view::{close_button_hit, draw_menu, link_index_for_row};
+use minimap::Minimap;
+use screen::{terminal_cell_width, text_cell_width, Frame, Renderer, Style};
 
 const DROP_X: u16 = 0;
 const DROP_HIT_WIDTH: u16 = 3; // virtual hit area: columns 0, 1, and 2
 const FRAME_X: u16 = 2;
 const CANVAS_X: u16 = FRAME_X + 1;
-const MENU_WIDTH: u16 = 26;
+const MENU_WIDTH: u16 = 17;
 const LOG_ROWS: u16 = 6;
-const MIN_WIDTH: u16 = 58;
-const MIN_CONTENT_HEIGHT: u16 = 18;
+const MIN_WIDTH: u16 = 60;
+const MIN_CONTENT_HEIGHT: u16 = 27;
 const TICK: Duration = Duration::from_millis(16);
 const MAX_EVENT_BATCH: usize = 64;
+const FRAME_OUTPUT_BUFFER_CAPACITY: usize = 64 * 1024;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(70);
-const BUILD_ID: &str = "v0.14 · wide-cell tombstones";
+const BUILD_ID: &str = "v0.26 · pinned tde + middle-dot paths";
 const FALL_TICK: Duration = Duration::from_millis(90);
+const ZOOM_LEVELS: [u16; 5] = [75, 100, 125, 150, 200];
+const DEFAULT_ZOOM_STEP: usize = 1;
+const RULE_TITLE_SEPARATOR: &str = "・・";
+const BREADCRUMB_SEPARATOR: &str = "・";
+const BREADCRUMB_ROOT_LABEL: &str = "root";
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Config {
     diagnostics: bool,
+    initial_path: Option<PathBuf>,
+    initial_depth: Option<usize>,
 }
 
 impl Config {
@@ -60,7 +73,18 @@ impl Config {
             })
             .unwrap_or(false);
 
+        let (mut initial_path, initial_depth) = {
+            let directives = launch_directives();
+            (directives.browse_path, directives.depth)
+        };
+        let mut browse_value = false;
+
         for arg in env::args().skip(1) {
+            if browse_value {
+                initial_path = Some(PathBuf::from(arg));
+                browse_value = false;
+                continue;
+            }
             match arg.as_str() {
                 "--diagnostics" | "--diagnostic" | "--diag" | "-d" => {
                     diagnostics = true;
@@ -68,15 +92,218 @@ impl Config {
                 "--no-diagnostics" | "--no-diagnostic" => {
                     diagnostics = false;
                 }
+                "--browse" | "--path" => browse_value = true,
+                _ if arg.starts_with("--browse=") => {
+                    initial_path = Some(PathBuf::from(&arg["--browse=".len()..]));
+                }
+                _ if !arg.starts_with('-') => initial_path = Some(PathBuf::from(arg)),
                 _ => {}
             }
         }
 
-        Self { diagnostics }
+        Self {
+            diagnostics,
+            initial_path,
+            initial_depth,
+        }
     }
 }
 
-struct TerminalGuard;
+#[derive(Default)]
+struct LaunchDirectives {
+    browse_path: Option<PathBuf>,
+    depth: Option<usize>,
+}
+
+fn launch_directives() -> LaunchDirectives {
+    // TRUEOS supplies launch directives through `vFile:launch`. Native hosts
+    // use the equivalent command-line flags parsed below instead.
+    LaunchDirectives::default()
+}
+
+fn launch_directives_from_script(script: &str) -> LaunchDirectives {
+    let mut directives = LaunchDirectives::default();
+    for line in script.lines().map(str::trim) {
+        let browse = line
+            .strip_prefix("browse ")
+            .map(str::trim)
+            .or_else(|| (line == "browse/").then_some("/"));
+        if let Some(path) = browse.filter(|path| !path.is_empty()) {
+            directives.browse_path = Some(PathBuf::from(path));
+            continue;
+        }
+        if let Some(depth) = line
+            .strip_prefix("depth ")
+            .map(str::trim)
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|depth| *depth <= 7)
+        {
+            directives.depth = Some(depth);
+        }
+    }
+    directives
+}
+
+fn browse_path_from_script(script: &str) -> Option<PathBuf> {
+    launch_directives_from_script(script).browse_path
+}
+
+#[cfg(test)]
+mod launch_script_tests {
+    use super::{
+        breadcrumb_layout, breadcrumb_path_at, browse_path_from_script, clip_text_head_cells,
+        launch_directives_from_script, sha256_rule_title, sha256_title_for_selection,
+        text_cell_width, Sha256Result, BREADCRUMB_ROOT_LABEL, BREADCRUMB_SEPARATOR,
+    };
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn uses_the_last_nonempty_browse_directive() {
+        assert_eq!(
+            browse_path_from_script("fs-scope trueosfs\nbrowse /\nbrowse trueosfs:disc4/apps\n"),
+            Some(PathBuf::from("trueosfs:disc4/apps"))
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_or_empty_directives() {
+        assert_eq!(
+            browse_path_from_script("fs-scope trueosfs\nbrowse   \n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_tde_root_and_depth_defaults() {
+        let directives = launch_directives_from_script("fs-scope trueosfs\nbrowse/\ndepth 2\n");
+        assert_eq!(directives.browse_path, Some(PathBuf::from("/")));
+        assert_eq!(directives.depth, Some(2));
+    }
+
+    #[test]
+    fn breadcrumb_uses_middle_dots_without_legacy_slashes() {
+        let layout = breadcrumb_layout(Path::new("/apps/texplo"), 0, 80).unwrap();
+        let labels: Vec<&str> = layout
+            .crumbs
+            .iter()
+            .map(|crumb| crumb.label.as_str())
+            .collect();
+        assert_eq!(labels, [BREADCRUMB_ROOT_LABEL, "apps", "texplo"]);
+
+        let expected_width = labels
+            .iter()
+            .map(|label| text_cell_width(label))
+            .sum::<usize>()
+            + 2 * text_cell_width(BREADCRUMB_SEPARATOR);
+        assert_eq!(layout.content_width as usize, expected_width);
+        assert!(!labels.iter().any(|label| label.contains('/')));
+    }
+
+    #[test]
+    fn middle_dot_breadcrumb_widths_drive_positions_and_hit_boundaries() {
+        let layout = breadcrumb_layout(Path::new("/apps/texplo"), 0, 80).unwrap();
+        let root = &layout.crumbs[0];
+        let apps = &layout.crumbs[1];
+        let texplo = &layout.crumbs[2];
+
+        assert_eq!(text_cell_width(BREADCRUMB_SEPARATOR), 2);
+        assert_eq!(apps.x, root.x + root.width + 2);
+        assert_eq!(texplo.x, apps.x + apps.width + 2);
+
+        assert_eq!(
+            breadcrumb_path_at(&layout, root.x, false),
+            Some(PathBuf::from("/"))
+        );
+        assert_eq!(
+            breadcrumb_path_at(&layout, root.x + root.width - 1, false),
+            Some(PathBuf::from("/"))
+        );
+        assert_eq!(
+            breadcrumb_path_at(&layout, root.x + root.width, false),
+            None
+        );
+        assert_eq!(
+            breadcrumb_path_at(&layout, apps.x, false),
+            Some(PathBuf::from("/apps"))
+        );
+        assert_eq!(breadcrumb_path_at(&layout, texplo.x, false), None);
+        assert_eq!(
+            breadcrumb_path_at(&layout, texplo.x + texplo.width - 1, true),
+            Some(PathBuf::from("/apps/texplo"))
+        );
+    }
+
+    #[test]
+    fn sha256_bottom_title_keeps_digest_as_the_clipped_prefix() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let title = sha256_rule_title(digest, "selected-file.txt");
+
+        assert_eq!(title, format!("{digest} ・ selected-file.txt"));
+        assert_eq!(clip_text_head_cells(&title, 20), digest[..20].to_string());
+        assert_eq!(clip_text_head_cells(&title, text_cell_width(&title)), title);
+    }
+
+    #[test]
+    fn sha256_bottom_title_is_only_relevant_to_its_selected_node() {
+        let result = Sha256Result {
+            source: 7,
+            digest: "a".repeat(64),
+            path: PathBuf::from("/apps/selected-file.txt"),
+        };
+
+        assert_eq!(
+            sha256_title_for_selection(
+                Some((7, Path::new("/apps/selected-file.txt"), "selected-file.txt")),
+                Some(&result)
+            ),
+            Some((format!("{} ・ selected-file.txt", result.digest), true))
+        );
+        assert_eq!(
+            sha256_title_for_selection(
+                Some((8, Path::new("/apps/other-file.txt"), "other-file.txt")),
+                Some(&result)
+            ),
+            Some(("other-file.txt".to_string(), false))
+        );
+        assert_eq!(
+            sha256_title_for_selection(
+                Some((
+                    7,
+                    Path::new("/other/selected-file.txt"),
+                    "selected-file.txt"
+                )),
+                Some(&result)
+            ),
+            Some(("selected-file.txt".to_string(), false))
+        );
+        assert_eq!(sha256_title_for_selection(None, Some(&result)), None);
+        assert_eq!(
+            sha256_title_for_selection(
+                Some((7, Path::new("/apps/selected-file.txt"), "selected-file.txt")),
+                None
+            ),
+            Some(("selected-file.txt".to_string(), false))
+        );
+    }
+}
+
+fn available_mounts(graph: &GraphView) -> Vec<MountLink> {
+    let root = graph
+        .root_path()
+        .ancestors()
+        .last()
+        .unwrap_or_else(|| graph.root_path());
+    vec![MountLink {
+        path: root.to_path_buf(),
+        label: root.display().to_string(),
+        primary: true,
+        read_only: false,
+    }]
+}
+
+struct TerminalGuard {
+    active: bool,
+}
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
@@ -89,17 +316,27 @@ impl TerminalGuard {
             EnableMouseCapture,
             Hide
         ) {
+            let _ = execute!(
+                stdout(),
+                ResetColor,
+                Show,
+                DisableMouseCapture,
+                EnableLineWrap,
+                LeaveAlternateScreen
+            );
             let _ = terminal::disable_raw_mode();
             return Err(err);
         }
 
-        Ok(Self)
+        Ok(Self { active: true })
     }
-}
 
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = execute!(
+    fn restore(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+
+        let screen_result = execute!(
             stdout(),
             ResetColor,
             Show,
@@ -107,7 +344,15 @@ impl Drop for TerminalGuard {
             EnableLineWrap,
             LeaveAlternateScreen
         );
-        let _ = terminal::disable_raw_mode();
+        let raw_result = terminal::disable_raw_mode();
+        self.active = false;
+        screen_result.and(raw_result)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
     }
 }
 
@@ -145,44 +390,102 @@ struct FallingGhost {
 struct App {
     graph: GraphView,
     selected: Option<usize>,
+    selected_stats: Option<SelectionStats>,
+    selected_sha256: Option<Sha256Result>,
+    path_hover: Option<PathBuf>,
     press: Option<Press>,
     drag: Option<DragState>,
     pan: Option<PanState>,
+    minimap_nav: bool,
     menu: MenuState,
+    minimap: Minimap,
+    minimap_visible: bool,
     modal: Option<Modal>,
     logs: VecDeque<String>,
     falling: Option<FallingGhost>,
     links: Vec<MenuLink>,
+    mounts: Vec<MountLink>,
+    zoom_step: usize,
     diagnostics: bool,
     resize_deadline: Option<Instant>,
     should_exit: bool,
+    should_shutdown: bool,
     dirty: bool,
 }
 
 impl App {
     fn new(config: Config) -> io::Result<Self> {
-        let graph = GraphView::from_current_dir()?;
+        let mut graph = match config.initial_path.as_deref() {
+            Some(path) => GraphView::from_path(path)?,
+            None => GraphView::from_current_dir()?,
+        };
+        if let Some(depth) = config.initial_depth {
+            graph.set_depth_limit(depth)?;
+        }
+        let mounts = available_mounts(&graph);
         let mut logs = VecDeque::new();
         logs.push_back(format!("⇝ {BUILD_ID}"));
         logs.push_back(format!("⇝ Mounted {}", graph.root_label()));
+        logs.push_back(format!("⇝ {} filesystem root mount(s)", mounts.len()));
         logs.push_back("⇝ LMB select/drag · MMB/WASD/arrows pan · Home center".to_string());
         logs.push_back("⇝ Tab changes menu segment · 0..9 runs local segment item".to_string());
+        logs.push_back("⇝ Esc hides TUI · tui reopens · Ctrl-Q exits app".to_string());
         Ok(Self {
             graph,
             selected: None,
+            selected_stats: None,
+            selected_sha256: None,
+            path_hover: None,
             press: None,
             drag: None,
             pan: None,
+            minimap_nav: false,
             menu: MenuState::default(),
+            minimap: Minimap::default(),
+            minimap_visible: true,
             modal: None,
             logs,
             falling: None,
             links: Vec::new(),
+            mounts,
+            zoom_step: DEFAULT_ZOOM_STEP,
             diagnostics: config.diagnostics,
             resize_deadline: None,
             should_exit: false,
+            should_shutdown: false,
             dirty: true,
         })
+    }
+
+    fn set_selected(&mut self, selected: Option<usize>) -> bool {
+        let changed = self.selected != selected;
+        self.selected = selected;
+        self.selected_stats = selected.and_then(|id| self.graph.selection_stats(id));
+        if changed {
+            self.selected_sha256 = None;
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    fn set_selected_sha256(&mut self, result: Sha256Result) {
+        self.selected_sha256 = Some(result);
+        self.mark_dirty();
+    }
+
+    fn clear_selected_sha256(&mut self) {
+        if self.selected_sha256.take().is_some() {
+            self.mark_dirty();
+        }
+    }
+
+    fn set_path_hover(&mut self, path: Option<PathBuf>) -> bool {
+        if self.path_hover == path {
+            return false;
+        }
+        self.path_hover = path;
+        self.dirty = true;
+        true
     }
 
     fn menu_context(&self) -> MenuContext {
@@ -211,6 +514,7 @@ impl App {
         self.press = None;
         self.drag = None;
         self.pan = None;
+        self.minimap_nav = false;
     }
 
     fn schedule_resize(&mut self) {
@@ -270,57 +574,95 @@ impl Layout {
     }
 }
 
-fn main() -> io::Result<()> {
-    let config = Config::from_args();
-    let _terminal = TerminalGuard::enter()?;
-    let mut out = stdout();
+fn run_terminal_session(
+    app: &mut App,
+    mut first_frame_ready: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    app.should_exit = false;
+    app.should_shutdown = false;
+    app.resize_deadline = None;
+    app.dirty = true;
+
+    let mut terminal_guard = TerminalGuard::enter()?;
+    let stdout = stdout();
+    let mut out = BufWriter::with_capacity(FRAME_OUTPUT_BUFFER_CAPACITY, stdout.lock());
     let mut renderer = Renderer::default();
-    let mut app = App::new(config)?;
+    let mut first_frame = true;
 
-    loop {
-        let now = Instant::now();
-        app.update_resize(now);
-        update_animation(&mut app, now);
+    let session_result = (|| {
+        loop {
+            let now = Instant::now();
+            app.update_resize(now);
+            update_animation(app, now);
 
-        if app.dirty && app.resize_deadline.is_none() {
-            let frame = compose_frame(&app)?;
-            renderer.present(&mut out, frame)?;
-            app.dirty = false;
-        }
-        if app.should_exit {
-            break;
-        }
-
-        if event::poll(TICK)? {
-            // Coalesce a bounded burst before repainting. Drag and key-repeat
-            // events often arrive in clusters; this renders the newest camera
-            // position once instead of every intermediate position.
-            for batch_index in 0..MAX_EVENT_BATCH {
-                handle_event(&mut app, event::read()?)?;
-                if app.should_exit || batch_index + 1 == MAX_EVENT_BATCH {
-                    break;
+            if app.dirty && app.resize_deadline.is_none() {
+                let frame = compose_frame(app)?;
+                renderer.present(&mut out, frame)?;
+                app.dirty = false;
+                if first_frame {
+                    first_frame_ready()?;
+                    first_frame = false;
                 }
-                if !event::poll(Duration::from_millis(0))? {
-                    break;
+            }
+            if app.should_exit {
+                break;
+            }
+
+            if event::poll(TICK)? {
+                // Coalesce a bounded burst before repainting. Drag and key-repeat
+                // events often arrive in clusters; this renders the newest camera
+                // position once instead of every intermediate position.
+                for batch_index in 0..MAX_EVENT_BATCH {
+                    let terminal_event = event::read()?;
+                    handle_event(app, terminal_event)?;
+                    if app.should_exit || batch_index + 1 == MAX_EVENT_BATCH {
+                        break;
+                    }
+                    if !event::poll(Duration::from_millis(0))? {
+                        break;
+                    }
                 }
             }
         }
-    }
+        Ok(())
+    })();
 
-    Ok(())
+    drop(out);
+    let restore_result = terminal_guard.restore();
+    match session_result {
+        Err(error) => {
+            let _ = restore_result;
+            Err(error)
+        }
+        Ok(()) => restore_result,
+    }
+}
+
+fn main() -> io::Result<()> {
+    let config = Config::from_args();
+    let mut app = App::new(config)?;
+    run_terminal_session(&mut app, || Ok(()))
 }
 
 fn handle_event(app: &mut App, event: Event) -> io::Result<()> {
     match event {
         Event::Resize(_, _) => app.schedule_resize(),
-        Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key.code)?,
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            handle_key(app, key.code, key.modifiers)?
+        }
         Event::Mouse(mouse) => handle_mouse(app, mouse)?,
         _ => {}
     }
     Ok(())
 }
 
-fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
+fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> io::Result<()> {
+    if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('q' | 'Q')) {
+        app.should_shutdown = true;
+        app.should_exit = true;
+        return Ok(());
+    }
+
     if app.modal.is_some() {
         let is_input = app
             .modal
@@ -369,18 +711,8 @@ fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
 
     match code {
         KeyCode::Esc => app.should_exit = true,
-        KeyCode::Tab => {
-            let context = app.menu_context();
-            if app.menu.cycle_section(false, context) {
-                app.mark_dirty();
-            }
-        }
-        KeyCode::BackTab => {
-            let context = app.menu_context();
-            if app.menu.cycle_section(true, context) {
-                app.mark_dirty();
-            }
-        }
+        KeyCode::Tab => cycle_menu_section(app, false),
+        KeyCode::BackTab => cycle_menu_section(app, true),
         KeyCode::Home => {
             if let Some(index) = MenuState::index_for_command(actions::MenuCommand::Center) {
                 let context = app.menu_context();
@@ -389,25 +721,49 @@ fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
             }
         }
         KeyCode::Left | KeyCode::Char('a') | KeyCode::Char('A') => {
-            app.graph.pan(2, 0);
-            app.mark_dirty();
+            if let Some(layout) = Layout::current(app.diagnostics)? {
+                if app.graph.pan_clamped(layout.viewport, 2, 0) {
+                    app.mark_dirty();
+                }
+            }
         }
         KeyCode::Right | KeyCode::Char('d') | KeyCode::Char('D') => {
-            app.graph.pan(-2, 0);
-            app.mark_dirty();
+            if let Some(layout) = Layout::current(app.diagnostics)? {
+                if app.graph.pan_clamped(layout.viewport, -2, 0) {
+                    app.mark_dirty();
+                }
+            }
         }
         KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('W') => {
-            app.graph.pan(0, 2);
-            app.mark_dirty();
+            if let Some(layout) = Layout::current(app.diagnostics)? {
+                if app.graph.pan_clamped(layout.viewport, 0, 2) {
+                    app.mark_dirty();
+                }
+            }
         }
         KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('S') => {
-            app.graph.pan(0, -2);
-            app.mark_dirty();
+            if let Some(layout) = Layout::current(app.diagnostics)? {
+                if app.graph.pan_clamped(layout.viewport, 0, -2) {
+                    app.mark_dirty();
+                }
+            }
         }
         KeyCode::Enter => {
-            if app.menu_context() == MenuContext::Folder {
-                if let Some(index) = MenuState::index_for_command(actions::MenuCommand::Enter) {
-                    invoke_menu(app, index)?;
+            if let Some(source) = app.selected {
+                if app
+                    .graph
+                    .node(source)
+                    .map(|node| node.is_dir)
+                    .unwrap_or(false)
+                {
+                    match app.graph.mount_node(source) {
+                        Ok(()) => {
+                            app.set_selected(None);
+                            app.clear_transient();
+                            app.log(format!("MOUNT · {}", app.graph.root_label()));
+                        }
+                        Err(err) => app.log(format!("ENTER FAILED · {err}")),
+                    }
                 }
             }
         }
@@ -423,7 +779,38 @@ fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
         }
         KeyCode::Char(ch) if ch.is_ascii_digit() => {
             let context = app.menu_context();
-            if let Some(index) = app.menu.index_for_hotkey(ch, context) {
+            if app.menu.section == MenuSection::Clip {
+                let visible = Layout::current(app.diagnostics)
+                    .ok()
+                    .flatten()
+                    .map(|layout| {
+                        MenuState::clip_visible_count(
+                            layout.separator_y,
+                            context,
+                            app.mounts.len().saturating_add(1),
+                            app.links.len(),
+                        )
+                    })
+                    .unwrap_or(0);
+                if let Some(link_index) =
+                    app.menu.clip_index_for_hotkey(ch, app.links.len(), visible)
+                {
+                    app.menu.set_clip_cursor(link_index, app.links.len());
+                    open_link(app, link_index)?;
+                } else if ch == '0' && app.links.is_empty() && visible > 0 {
+                    app.log("CLIP · Empty");
+                }
+            } else if app.menu.section == MenuSection::Mount {
+                let mount_count = app.mounts.len().saturating_add(1);
+                if let Some(index) = ch
+                    .to_digit(10)
+                    .map(|index| index as usize)
+                    .filter(|index| *index < MenuState::visible_mount_count(mount_count))
+                {
+                    app.menu.set_mount_cursor(index, mount_count);
+                    open_mount(app, index)?;
+                }
+            } else if let Some(index) = app.menu.index_for_hotkey(ch, context) {
                 app.menu.set_cursor(index, context);
                 invoke_menu(app, index)?;
             }
@@ -431,6 +818,31 @@ fn handle_key(app: &mut App, code: KeyCode) -> io::Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn cycle_menu_section(app: &mut App, reverse: bool) {
+    let context = app.menu_context();
+    let mut changed = app.menu.cycle_section(reverse, context);
+    if app.menu.section == MenuSection::Clip {
+        let clip_visible = Layout::current(app.diagnostics)
+            .ok()
+            .flatten()
+            .and_then(|layout| {
+                MenuState::clip_header_row(
+                    layout.separator_y,
+                    context,
+                    app.mounts.len().saturating_add(1),
+                    app.links.len(),
+                )
+            })
+            .is_some();
+        if !clip_visible {
+            changed |= app.menu.cycle_section(reverse, context);
+        }
+    }
+    if changed {
+        app.mark_dirty();
+    }
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
@@ -447,14 +859,80 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         return Ok(());
     }
 
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && close_button_hit(layout.menu_x, MENU_WIDTH, mouse.column, mouse.row)
+    {
+        app.should_exit = true;
+        return Ok(());
+    }
+
+    if matches!(mouse.kind, MouseEventKind::Moved) {
+        let hover = if mouse.row == 0 {
+            breadcrumb_target_at(app, layout, mouse.column)
+        } else {
+            None
+        };
+        app.set_path_hover(hover);
+    }
+
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && map_toggle_hit(mouse.column, mouse.row)
+    {
+        app.minimap_visible = !app.minimap_visible;
+        app.mark_dirty();
+        return Ok(());
+    }
+
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && mouse.row == 0 {
+        if let Some(target) = breadcrumb_target_at(app, layout, mouse.column) {
+            match app.graph.mount_path(&target) {
+                Ok(()) => {
+                    app.set_selected(None);
+                    app.set_path_hover(None);
+                    app.clear_transient();
+                    app.log(format!("MOUNT · {}", app.graph.root_label()));
+                }
+                Err(err) => app.log(format!("MOUNT FAILED · {err}")),
+            }
+            return Ok(());
+        }
+    }
+
+    // Left-dragging the minimap is a navigation scrub. Mouse-down performs
+    // the first jump; subsequent drag events keep mapping the pointer through
+    // the same cached minimap world bounds. No minimap scene rebuild is needed.
+    if app.minimap_nav {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(geometry) = minimap_geometry(app, layout) {
+                    if let Some((world_x, world_y)) =
+                        Minimap::world_at(&app.graph, geometry, mouse.column, mouse.row)
+                    {
+                        if app.graph.jump_to_world(layout.viewport, world_x, world_y) {
+                            app.mark_dirty();
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            MouseEventKind::Up(_) => {
+                app.minimap_nav = false;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     if let Some(pan) = app.pan {
         match mouse.kind {
             MouseEventKind::Drag(_) => {
                 let dx = mouse.column as i32 - pan.start_x as i32;
                 let dy = mouse.row as i32 - pan.start_y as i32;
                 let next = (pan.camera_x + dx * 2, pan.camera_y + dy * 2);
-                if app.graph.camera() != next {
-                    app.graph.set_camera(next.0, next.1);
+                if app
+                    .graph
+                    .set_camera_clamped(layout.viewport, next.0, next.1)
+                {
                     app.mark_dirty();
                 }
                 return Ok(());
@@ -473,21 +951,42 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         && app.pan.is_none()
     {
         let context = app.menu_context();
-        if let Some(index) = MenuState::index_for_row(mouse.row, context) {
+        let mount_count = app.mounts.len().saturating_add(1);
+        if let Some(mount_index) = MenuState::mount_index_for_row(mouse.row, mount_count) {
+            if app.menu.set_mount_cursor(mount_index, mount_count) {
+                app.mark_dirty();
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                open_mount(app, mount_index)?;
+            }
+        } else if let Some(index) = MenuState::index_for_row(mouse.row, context, mount_count) {
             if app.menu.set_cursor(index, context) {
                 app.mark_dirty();
             }
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 invoke_menu(app, index)?;
             }
-        } else if let Some(section) = MenuState::section_for_header_row(mouse.row) {
+        } else if let Some(section) = MenuState::section_for_header_row(
+            mouse.row,
+            layout.separator_y,
+            context,
+            mount_count,
+            app.links.len(),
+        ) {
             if app.menu.set_section(section, context) {
                 app.mark_dirty();
             }
-        } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            if let Some(link_index) =
-                link_index_for_row(mouse.row, layout.separator_y, context, app.links.len())
-            {
+        } else if let Some(link_index) = link_index_for_row(
+            mouse.row,
+            layout.separator_y,
+            context,
+            mount_count,
+            app.links.len(),
+        ) {
+            if app.menu.set_clip_cursor(link_index, app.links.len()) {
+                app.mark_dirty();
+            }
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 open_link(app, link_index)?;
             }
         }
@@ -511,12 +1010,24 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         MouseEventKind::Down(MouseButton::Left)
             if layout.viewport.contains(mouse.column, mouse.row) =>
         {
-            if let Some(node) = app
-                .graph
-                .hit_test(layout.viewport, mouse.column, mouse.row)
-            {
+            if let Some(geometry) = minimap_geometry(app, layout) {
+                if geometry.contains(mouse.column, mouse.row) {
+                    if let Some((world_x, world_y)) =
+                        Minimap::world_at(&app.graph, geometry, mouse.column, mouse.row)
+                    {
+                        if app.graph.jump_to_world(layout.viewport, world_x, world_y) {
+                            app.mark_dirty();
+                        }
+                    }
+                    app.minimap_nav = true;
+                    app.press = None;
+                    app.drag = None;
+                    return Ok(());
+                }
+            }
+            if let Some(node) = app.graph.hit_test(layout.viewport, mouse.column, mouse.row) {
                 if app.selected != Some(node) {
-                    app.selected = Some(node);
+                    app.set_selected(Some(node));
                     app.mark_dirty();
                 }
                 app.press = Some(Press {
@@ -526,7 +1037,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                 });
             } else {
                 if app.selected.is_some() {
-                    app.selected = None;
+                    app.set_selected(None);
                     app.mark_dirty();
                 }
                 app.press = None;
@@ -537,14 +1048,25 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                 if press.node == 0 {
                     return Ok(());
                 }
-                let moved = mouse.column.abs_diff(press.start_x) + mouse.row.abs_diff(press.start_y);
+                let moved =
+                    mouse.column.abs_diff(press.start_x) + mouse.row.abs_diff(press.start_y);
                 if moved >= 1 {
                     let over_menu =
                         mouse.column >= layout.menu_x && mouse.row <= layout.separator_y;
                     let over_trash = !over_menu
                         && is_trash_column(mouse.column)
                         && mouse.row <= layout.separator_y;
-                    let target = if over_trash || over_menu {
+                    let over_minimap = !over_menu
+                        && !over_trash
+                        && minimap_hit(app, layout, mouse.column, mouse.row);
+                    let path_target = if over_trash || over_menu || over_minimap || mouse.row != 0 {
+                        None
+                    } else {
+                        breadcrumb_drop_target_at(app, layout, mouse.column, press.node)
+                    };
+                    app.set_path_hover(path_target.clone());
+                    let target = if over_trash || over_menu || over_minimap || path_target.is_some()
+                    {
                         None
                     } else {
                         app.graph.folder_drop_target(
@@ -571,18 +1093,22 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         }
         MouseEventKind::Up(_) => {
             if let Some(drag) = app.drag.take() {
+                let path_target = (mouse.row == 0)
+                    .then(|| breadcrumb_drop_target_at(app, layout, mouse.column, drag.node))
+                    .flatten();
                 let dropped_in_menu = drag.over_menu
                     || (mouse.column >= layout.menu_x && mouse.row <= layout.separator_y);
                 let dropped_in_trash = !dropped_in_menu
                     && (drag.over_trash
-                        || (is_trash_column(mouse.column)
-                            && mouse.row <= layout.separator_y));
+                        || (is_trash_column(mouse.column) && mouse.row <= layout.separator_y));
                 if dropped_in_menu {
                     add_link(app, drag.node);
                 } else if dropped_in_trash {
-                    app.modal = Some(
-                        Modal::trash_node(&app.graph, drag.node).with_origin_y(mouse.row),
-                    );
+                    app.modal =
+                        Some(Modal::trash_node(&app.graph, drag.node).with_origin_y(mouse.row));
+                    app.mark_dirty();
+                } else if let Some(target) = path_target {
+                    app.modal = Some(Modal::move_to_path(&app.graph, drag.node, target));
                     app.mark_dirty();
                 } else if let Some(target) = drag.target {
                     app.modal = Some(Modal::move_node(&app.graph, drag.node, target));
@@ -591,6 +1117,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                     app.log("MOVE · cancelled · target must be a valid folder");
                 }
             }
+            app.set_path_hover(None);
             app.press = None;
             app.mark_dirty();
         }
@@ -602,6 +1129,26 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
 
 fn is_trash_column(x: u16) -> bool {
     x < DROP_HIT_WIDTH
+}
+
+fn minimap_geometry(app: &App, layout: Layout) -> Option<minimap::MinimapGeometry> {
+    if !app.minimap_visible {
+        return None;
+    }
+    let (width, height) = terminal::size().ok()?;
+    Minimap::geometry(
+        width,
+        height,
+        layout.viewport,
+        MIN_WIDTH,
+        Layout::minimum_height(app.diagnostics),
+    )
+}
+
+fn minimap_hit(app: &App, layout: Layout, x: u16, y: u16) -> bool {
+    minimap_geometry(app, layout)
+        .map(|geometry| geometry.contains(x, y))
+        .unwrap_or(false)
 }
 
 fn add_link(app: &mut App, node_id: usize) {
@@ -618,6 +1165,11 @@ fn add_link(app: &mut App, node_id: usize) {
     let status = format!("LINK · {}", link.path.display());
     app.links.retain(|existing| existing.path != link.path);
     app.links.push(link);
+    if app.links.len() > 10 {
+        app.links.remove(0);
+    }
+    let newest = app.links.len().saturating_sub(1);
+    app.menu.set_clip_cursor(newest, app.links.len());
     app.log(status);
 }
 
@@ -629,7 +1181,7 @@ fn open_link(app: &mut App, index: usize) -> io::Result<()> {
     let result: io::Result<String> = if link.is_dir {
         match app.graph.mount_path(&link.path) {
             Ok(()) => {
-                app.selected = None;
+                app.set_selected(None);
                 Ok(format!("LINK · enter {}", link.path.display()))
             }
             Err(err) => Err(err),
@@ -637,7 +1189,8 @@ fn open_link(app: &mut App, index: usize) -> io::Result<()> {
     } else if let Some(parent) = link.path.parent() {
         match app.graph.mount_path(parent) {
             Ok(()) => {
-                app.selected = app.graph.find_node_by_path(&link.path);
+                let selected = app.graph.find_node_by_path(&link.path);
+                app.set_selected(selected);
                 Ok(format!("LINK · {}", link.path.display()))
             }
             Err(err) => Err(err),
@@ -651,6 +1204,9 @@ fn open_link(app: &mut App, index: usize) -> io::Result<()> {
 
     match result {
         Ok(status) => {
+            // Mounting through a file link may reuse the same numeric node id
+            // after reload, so clear by path transition rather than id alone.
+            app.clear_selected_sha256();
             app.clear_transient();
             app.log(status);
         }
@@ -659,10 +1215,42 @@ fn open_link(app: &mut App, index: usize) -> io::Result<()> {
     Ok(())
 }
 
+fn open_mount(app: &mut App, index: usize) -> io::Result<()> {
+    let result: io::Result<String> = if index == 0 {
+        app.graph.reload().map(|()| {
+            app.mounts = available_mounts(&app.graph);
+            format!("MOUNT · refreshed {} root(s)", app.mounts.len())
+        })
+    } else {
+        let Some(mount) = app.mounts.get(index - 1).cloned() else {
+            return Ok(());
+        };
+        app.graph
+            .mount_path(&mount.path)
+            .map(|()| format!("MOUNT · {}", mount.label))
+    };
+
+    match result {
+        Ok(status) => {
+            app.set_selected(None);
+            app.clear_transient();
+            app.log(status);
+        }
+        Err(err) => app.log(format!("MOUNT FAILED · {err}")),
+    }
+    Ok(())
+}
+
 fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
     let entry = MENU_ENTRIES[index];
+    if entry.command == actions::MenuCommand::Sha256 {
+        // A new SHA request supersedes the previous digest, including when it
+        // fails or no item is selected.
+        app.clear_selected_sha256();
+    }
     match dispatch_menu(entry.command, &mut app.graph, app.selected)? {
         Dispatch::Exit => app.should_exit = true,
+        Dispatch::Zoom => cycle_terminal_zoom(app)?,
         Dispatch::Modal(mut modal) => {
             if modal.trash_origin_y.is_none() {
                 let trash_source = match &modal.pending {
@@ -678,6 +1266,13 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
             app.modal = Some(modal);
             app.mark_dirty();
         }
+        Dispatch::Sha256(result) => {
+            let status = format!("SHA256 · {} · {}", result.digest, result.path.display());
+            if app.selected == Some(result.source) {
+                app.set_selected_sha256(result);
+            }
+            app.log(status);
+        }
         Dispatch::Status(status) => {
             if matches!(
                 entry.command,
@@ -685,13 +1280,25 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
                     | actions::MenuCommand::Parent
                     | actions::MenuCommand::Enter
                     | actions::MenuCommand::Depth
+                    | actions::MenuCommand::Zip
             ) {
-                app.selected = None;
+                app.set_selected(None);
                 app.clear_transient();
             }
             app.log(status);
         }
     }
+    Ok(())
+}
+
+fn cycle_terminal_zoom(app: &mut App) -> io::Result<()> {
+    let next = (app.zoom_step + 1) % ZOOM_LEVELS.len();
+    let percent = ZOOM_LEVELS[next];
+    let mut output = stdout().lock();
+    write!(output, "\x1b]777;terminal_zoom={percent}\x07")?;
+    output.flush()?;
+    app.zoom_step = next;
+    app.log(format!("VIEW · zoom {percent}%"));
     Ok(())
 }
 
@@ -714,13 +1321,7 @@ fn confirm_modal(app: &mut App, yes: bool) -> io::Result<()> {
         return Ok(());
     }
 
-    if modal.is_input()
-        && modal
-            .input_value()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-    {
+    if modal.is_input() && modal.input_value().map(str::trim).unwrap_or("").is_empty() {
         app.modal = Some(modal);
         app.log("INPUT · name cannot be empty");
         return Ok(());
@@ -732,18 +1333,16 @@ fn confirm_modal(app: &mut App, yes: bool) -> io::Result<()> {
         None
     };
     let falling_seed = match &modal.pending {
-        PendingAction::Trash { source } => app.graph.node(*source).map(|node| {
-            (
-                if node.is_dir { "🖿" } else { "🖹" },
-                modal.trash_origin_y,
-            )
-        }),
+        PendingAction::Trash { source } => app
+            .graph
+            .node(*source)
+            .map(|node| (if node.is_dir { "🖿" } else { "🖹" }, modal.trash_origin_y)),
         _ => None,
     };
 
     match execute_modal(modal, &mut app.graph) {
         Ok(outcome) => {
-            app.selected = None;
+            app.set_selected(None);
             app.clear_transient();
             app.log(outcome.status);
             if outcome.trashed_label.is_some() {
@@ -769,6 +1368,13 @@ fn confirm_modal(app: &mut App, yes: bool) -> io::Result<()> {
 }
 
 fn update_animation(app: &mut App, now: Instant) {
+    // Do not query terminal geometry on every idle event-loop turn. On TrueOS
+    // terminal::size() is a real platform boundary; only the falling-trash
+    // animation needs a fresh layout while it is active.
+    if app.falling.is_none() {
+        return;
+    }
+
     let stop_y = Layout::current(app.diagnostics)
         .ok()
         .flatten()
@@ -799,7 +1405,7 @@ fn update_animation(app: &mut App, now: Instant) {
     }
 }
 
-fn compose_frame(app: &App) -> io::Result<Frame> {
+fn compose_frame(app: &mut App) -> io::Result<Frame> {
     let (width, height) = terminal::size()?;
     let mut frame = Frame::new(width, height);
 
@@ -818,6 +1424,11 @@ fn compose_frame(app: &App) -> io::Result<Frame> {
         return Ok(frame);
     };
 
+    // Resize changes the viewport and therefore the legal camera rectangle.
+    // Clamp once before composing so a formerly valid camera can never reveal
+    // empty space after the terminal becomes larger.
+    app.graph.clamp_camera(layout.viewport);
+
     draw_top_rule(&mut frame, app, layout.menu_x);
     draw_canvas_frame(&mut frame, layout.canvas_bottom_y);
     draw_dropzone(&mut frame, app, layout);
@@ -831,6 +1442,16 @@ fn compose_frame(app: &App) -> io::Result<Frame> {
         drag_id,
         drop_target,
     );
+
+    if app.minimap_visible {
+        app.minimap.draw(
+            &mut frame,
+            &app.graph,
+            layout.viewport,
+            MIN_WIDTH,
+            Layout::minimum_height(app.diagnostics),
+        );
+    }
 
     if let Some(drag) = app.drag {
         draw_drag_box(&mut frame, app, drag, layout);
@@ -846,23 +1467,19 @@ fn compose_frame(app: &App) -> io::Result<Frame> {
         app.menu,
         MENU_WIDTH,
         app.menu_context(),
+        &app.mounts,
         &app.links,
+        app.selected_stats.as_ref(),
+        app.zoom_step,
         app.graph.depth_limit(),
+        app.graph.spacing_level(),
+        app.graph.line_style(),
+        app.graph.layout_mode(),
     );
-    draw_bottom_rule(
-        &mut frame,
-        app,
-        layout.menu_x,
-        layout.separator_y,
-    );
+    draw_bottom_rule(&mut frame, app, layout.menu_x, layout.separator_y);
 
     if app.diagnostics {
-        draw_logs(
-            &mut frame,
-            app,
-            layout.separator_y + 1,
-            layout.width,
-        );
+        draw_logs(&mut frame, app, layout.separator_y + 1, layout.width);
     }
 
     if let Some(modal) = &app.modal {
@@ -872,14 +1489,223 @@ fn compose_frame(app: &App) -> io::Result<Frame> {
     Ok(frame)
 }
 
-fn draw_top_rule(frame: &mut Frame, app: &App, menu_x: u16) {
-    let map_cluster = " 🗺 ";
-    let map_width = map_cluster.chars().count() as u16;
-    let map_x = menu_x.saturating_sub(map_width);
-    let title = app.graph.root_label();
+#[derive(Clone, Debug)]
+struct BreadcrumbCrumb {
+    label: String,
+    path: PathBuf,
+    x: u16,
+    width: u16,
+    is_last: bool,
+}
 
-    draw_rule_title(frame, 0, 0, map_x, &title, "🞃", "🞁");
-    print_at(frame, map_x, 0, map_cluster, Style::default());
+#[derive(Clone, Debug)]
+struct BreadcrumbLayout {
+    block_x: u16,
+    content_x: u16,
+    content_width: u16,
+    prefix: Option<String>,
+    crumbs: Vec<BreadcrumbCrumb>,
+}
+
+fn map_toggle_hit(x: u16, y: u16) -> bool {
+    y == 0 && x < text_cell_width("🗺  ") as u16
+}
+
+fn draw_top_rule(frame: &mut Frame, app: &App, menu_x: u16) {
+    // World-map owns the physical top-left. Two cells of air to its right keep
+    // the breadcrumb detached without consuming a leading drop-rail column.
+    let map_cluster = "🗺  ";
+    let map_width = text_cell_width(map_cluster) as u16;
+
+    print_at(frame, 0, 0, map_cluster, Style::default());
+    draw_pattern(frame, map_width, 0, menu_x, "🞃", "🞁");
+    if let Some(layout) = breadcrumb_layout(app.graph.root_path(), map_width, menu_x) {
+        draw_breadcrumb(frame, app, &layout);
+    }
+}
+
+fn breadcrumb_target_at(app: &App, layout: Layout, x: u16) -> Option<PathBuf> {
+    let map_width = text_cell_width("🗺  ") as u16;
+    let crumbs = breadcrumb_layout(app.graph.root_path(), map_width, layout.menu_x)?;
+    breadcrumb_path_at(&crumbs, x, false)
+}
+
+fn breadcrumb_drop_target_at(app: &App, layout: Layout, x: u16, source: usize) -> Option<PathBuf> {
+    let map_width = text_cell_width("🗺  ") as u16;
+    let crumbs = breadcrumb_layout(app.graph.root_path(), map_width, layout.menu_x)?;
+    breadcrumb_path_at(&crumbs, x, true).filter(|path| app.graph.can_move_to_path(source, path))
+}
+
+fn breadcrumb_path_at(layout: &BreadcrumbLayout, x: u16, include_last: bool) -> Option<PathBuf> {
+    layout
+        .crumbs
+        .iter()
+        .find(|crumb| {
+            (include_last || !crumb.is_last)
+                && x >= crumb.x
+                && x < crumb.x.saturating_add(crumb.width)
+        })
+        .map(|crumb| crumb.path.clone())
+}
+
+fn breadcrumb_layout(path: &Path, start_x: u16, end_x: u16) -> Option<BreadcrumbLayout> {
+    let width = end_x.saturating_sub(start_x) as usize;
+    if width < 8 {
+        return None;
+    }
+    let separator_width = text_cell_width(RULE_TITLE_SEPARATOR);
+    let separator_pair_width = separator_width.saturating_mul(2);
+    let max_content = width.saturating_sub(separator_pair_width);
+    if max_content == 0 {
+        return None;
+    }
+
+    let raw = path_components(path);
+    if raw.is_empty() {
+        return None;
+    }
+    let breadcrumb_separator_width = text_cell_width(BREADCRUMB_SEPARATOR);
+
+    let content_width_for = |from: usize| -> usize {
+        let mut used = if from > 0 {
+            text_cell_width("…") + breadcrumb_separator_width
+        } else {
+            0
+        };
+        for i in from..raw.len() {
+            if i > from {
+                used += breadcrumb_separator_width;
+            }
+            used += text_cell_width(&raw[i].0);
+        }
+        used
+    };
+
+    let mut from = 0usize;
+    while from + 1 < raw.len() && content_width_for(from) > max_content {
+        from += 1;
+    }
+
+    let prefix = (from > 0).then(|| format!("…{BREADCRUMB_SEPARATOR}"));
+    let mut labels: Vec<String> = raw[from..].iter().map(|(label, _)| label.clone()).collect();
+    let mut content_width = content_width_for(from);
+    if content_width > max_content {
+        // A single very long final directory name: preserve its tail and keep
+        // the final crumb bold/non-clickable.
+        let prefix_width = prefix.as_deref().map(text_cell_width).unwrap_or(0);
+        let budget = max_content.saturating_sub(prefix_width);
+        if let Some(last) = labels.last_mut() {
+            *last = clip_text_tail_cells(last, budget);
+        }
+        content_width = prefix_width + labels.last().map(|s| text_cell_width(s)).unwrap_or(0);
+    }
+
+    let block_width = content_width
+        .saturating_add(separator_pair_width)
+        .min(width);
+    let block_x = start_x + ((width - block_width) / 2) as u16;
+    let content_x = block_x.saturating_add(separator_width as u16);
+    let mut cursor = content_x;
+    if let Some(prefix) = &prefix {
+        cursor = cursor.saturating_add(text_cell_width(prefix) as u16);
+    }
+
+    let mut crumbs = Vec::new();
+    for (local, source_index) in (from..raw.len()).enumerate() {
+        if local > 0 {
+            cursor = cursor.saturating_add(breadcrumb_separator_width as u16);
+        }
+        let label = labels.get(local).cloned().unwrap_or_default();
+        let label_width = text_cell_width(&label) as u16;
+        crumbs.push(BreadcrumbCrumb {
+            label,
+            path: raw[source_index].1.clone(),
+            x: cursor,
+            width: label_width,
+            is_last: source_index + 1 == raw.len(),
+        });
+        cursor = cursor.saturating_add(label_width);
+    }
+
+    Some(BreadcrumbLayout {
+        block_x,
+        content_x,
+        content_width: content_width as u16,
+        prefix,
+        crumbs,
+    })
+}
+
+fn path_components(path: &Path) -> Vec<(String, PathBuf)> {
+    let mut current = PathBuf::new();
+    let mut out = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                out.push((
+                    prefix.as_os_str().to_string_lossy().into_owned(),
+                    current.clone(),
+                ));
+            }
+            Component::RootDir => {
+                current.push(Path::new("/"));
+                out.push((BREADCRUMB_ROOT_LABEL.to_string(), current.clone()));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                current.push("..");
+                out.push(("..".to_string(), current.clone()));
+            }
+            Component::Normal(name) => {
+                current.push(name);
+                out.push((name.to_string_lossy().into_owned(), current.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn draw_breadcrumb(frame: &mut Frame, app: &App, layout: &BreadcrumbLayout) {
+    // The wide centered middle dots bridge the text and Braille rule.
+    print_at(
+        frame,
+        layout.block_x,
+        0,
+        RULE_TITLE_SEPARATOR,
+        Style::default(),
+    );
+    print_at(
+        frame,
+        layout.content_x + layout.content_width,
+        0,
+        RULE_TITLE_SEPARATOR,
+        Style::default(),
+    );
+
+    let mut cursor = layout.content_x;
+    if let Some(prefix) = &layout.prefix {
+        print_at(frame, cursor, 0, prefix, Style::default());
+        cursor += text_cell_width(prefix) as u16;
+    }
+
+    for (index, crumb) in layout.crumbs.iter().enumerate() {
+        if index > 0 {
+            print_at(frame, cursor, 0, BREADCRUMB_SEPARATOR, Style::default());
+            cursor += text_cell_width(BREADCRUMB_SEPARATOR) as u16;
+        }
+
+        let mut style = Style::default();
+        if app.drag.is_some() && app.path_hover.as_ref() == Some(&crumb.path) {
+            style = Style::new(Color::Black, Color::Cyan);
+        } else if crumb.is_last {
+            style = style.bold();
+        } else if app.path_hover.as_ref() == Some(&crumb.path) {
+            style = style.underline();
+        }
+        print_at(frame, cursor, 0, &crumb.label, style);
+        cursor += crumb.width;
+    }
 }
 
 fn draw_canvas_frame(frame: &mut Frame, bottom_y: u16) {
@@ -896,28 +1722,32 @@ fn draw_canvas_frame(frame: &mut Frame, bottom_y: u16) {
 }
 
 fn draw_dropzone(frame: &mut Frame, app: &App, layout: Layout) {
-    let active = app.drag.filter(|drag| drag.over_trash).and_then(|drag| {
+    // The delete target remains a virtual 3-column hit area. Hover does not
+    // repaint boxes/backgrounds: only the dragged file/folder glyph appears.
+    if let Some((y, icon)) = app.drag.filter(|drag| drag.over_trash).and_then(|drag| {
         app.graph.node(drag.node).map(|node| {
             (
                 drag.y.clamp(1, layout.canvas_bottom_y),
                 if node.is_dir { "🖿" } else { "🖹" },
             )
         })
-    });
-
-    if let Some((y, icon)) = active {
-        let active_style = Style::new(Color::White, Color::DarkRed);
-        print_at(frame, DROP_X, y, icon, active_style);
-        print_at(frame, DROP_X, layout.separator_y, "🗑", active_style);
-    } else {
+    }) {
         print_at(
             frame,
             DROP_X,
-            layout.separator_y,
-            "🗑",
-            Style::new(Color::DarkGrey, Color::Reset),
+            y,
+            icon,
+            Style::new(Color::Grey, Color::Reset),
         );
     }
+
+    print_at(
+        frame,
+        DROP_X,
+        layout.separator_y,
+        "🗑",
+        Style::new(Color::DarkGrey, Color::Reset),
+    );
 }
 
 fn draw_drag_box(frame: &mut Frame, app: &App, drag: DragState, layout: Layout) {
@@ -978,17 +1808,38 @@ fn draw_falling(frame: &mut Frame, falling: &FallingGhost, layout: Layout) {
 }
 
 fn draw_bottom_rule(frame: &mut Frame, app: &App, menu_x: u16, y: u16) {
-    let selected_path = app
-        .selected
-        .and_then(|id| app.graph.node(id))
-        .filter(|node| !node.is_placeholder)
-        .map(|node| node.path.display().to_string())
-        .filter(|path| !path.is_empty());
+    let selected = app.selected.and_then(|id| {
+        app.graph
+            .node(id)
+            .filter(|node| !node.is_placeholder)
+            .map(|node| (id, node.path.as_path(), node.name.as_str()))
+    });
+    let title = sha256_title_for_selection(selected, app.selected_sha256.as_ref());
 
-    match selected_path {
-        Some(path) => draw_rule_title(frame, FRAME_X, y, menu_x, &path, "🞁", "🞃"),
+    match title {
+        Some((title, preserve_prefix)) => {
+            draw_rule_title(frame, FRAME_X, y, menu_x, &title, "🞁", "🞃", preserve_prefix)
+        }
         None => draw_pattern(frame, FRAME_X, y, menu_x, "🞁", "🞃"),
     }
+}
+
+fn sha256_title_for_selection(
+    selected: Option<(usize, &Path, &str)>,
+    result: Option<&Sha256Result>,
+) -> Option<(String, bool)> {
+    let (selected_id, selected_path, name) = selected?;
+    if name.is_empty() {
+        return None;
+    }
+    result
+        .filter(|result| result.source == selected_id && result.path == selected_path)
+        .map(|result| (sha256_rule_title(&result.digest, name), true))
+        .or_else(|| Some((name.to_string(), false)))
+}
+
+fn sha256_rule_title(digest: &str, name: &str) -> String {
+    format!("{digest} {BREADCRUMB_SEPARATOR} {name}")
 }
 
 fn draw_rule_title(
@@ -999,43 +1850,45 @@ fn draw_rule_title(
     title: &str,
     first: &'static str,
     second: &'static str,
+    preserve_prefix: bool,
 ) {
     let width = end_x.saturating_sub(start_x) as usize;
     draw_pattern(frame, start_x, y, end_x, first, second);
-    if width < 7 || title.is_empty() {
+    let separator_width = text_cell_width(RULE_TITLE_SEPARATOR);
+    let separator_pair_width = separator_width.saturating_mul(2);
+    if width <= separator_pair_width || title.is_empty() {
         return;
     }
 
-    const SIDE: &str = "🞃🞁";
-    let side_width = SIDE.chars().count();
-    let fixed = side_width * 2 + 2;
-    let title_width = width.saturating_sub(fixed).max(1);
-    let visible = clip_text_tail(title, title_width);
-    let label = format!("{SIDE} {visible} {SIDE}");
-    let label_width = label.chars().count();
+    let title_width = width.saturating_sub(separator_pair_width).max(1);
+    // SHA-256 titles begin with the digest. Keep that leading identity under
+    // clipping; ordinary filenames retain their established tail clipping.
+    let visible = if preserve_prefix {
+        clip_text_head_cells(title, title_width)
+    } else {
+        clip_text_tail_cells(title, title_width)
+    };
+    let visible_width = text_cell_width(&visible);
+    let block_width = visible_width
+        .saturating_add(separator_pair_width)
+        .min(width);
+    let block_x = start_x + ((width - block_width) / 2) as u16;
+    let text_x = block_x.saturating_add(separator_width as u16);
 
-    if label_width >= width {
-        print_at(
-            frame,
-            start_x,
-            y,
-            &clip_text_tail(&label, width),
-            Style::default(),
-        );
-        return;
-    }
-
-    let x = start_x + ((width - label_width) / 2) as u16;
-    print_at(frame, x, y, &label, Style::default());
+    print_at(frame, block_x, y, RULE_TITLE_SEPARATOR, Style::default());
+    print_at(frame, text_x, y, &visible, Style::default());
+    print_at(
+        frame,
+        text_x.saturating_add(visible_width as u16),
+        y,
+        RULE_TITLE_SEPARATOR,
+        Style::default(),
+    );
 }
 
 fn draw_logs(frame: &mut Frame, app: &App, start_y: u16, width: u16) {
     for row in 0..LOG_ROWS {
-        let text = app
-            .logs
-            .get(row as usize)
-            .map(String::as_str)
-            .unwrap_or("");
+        let text = app.logs.get(row as usize).map(String::as_str).unwrap_or("");
         let clipped = clip_text(text, width as usize);
         print_at(frame, 0, start_y + row, &clipped, Style::default());
     }
@@ -1050,11 +1903,9 @@ fn draw_pattern(
     second: &'static str,
 ) {
     for x in start_x..end_x {
-        let glyph = if (x - start_x) % 2 == 0 {
-            first
-        } else {
-            second
-        };
+        // Absolute-column parity keeps every independently drawn segment on
+        // the same 🞁/🞃 phase, including around overpainted titles.
+        let glyph = if x % 2 == 0 { first } else { second };
         print_at(frame, x, y, glyph, Style::default());
     }
 }
@@ -1073,6 +1924,53 @@ fn clip_text(text: &str, max: usize) -> String {
     let mut clipped: String = text.chars().take(max - 3).collect();
     clipped.push_str("...");
     clipped
+}
+
+fn clip_text_tail_cells(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if text_cell_width(text) <= max {
+        return text.to_string();
+    }
+    if max == 1 {
+        return "…".to_string();
+    }
+
+    let budget = max - 1;
+    let mut tail = Vec::new();
+    let mut used = 0usize;
+    for ch in text.chars().rev() {
+        let width = terminal_cell_width(ch) as usize;
+        if used + width > budget {
+            break;
+        }
+        tail.push(ch);
+        used += width;
+    }
+    tail.reverse();
+    format!("…{}", tail.into_iter().collect::<String>())
+}
+
+fn clip_text_head_cells(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if text_cell_width(text) <= max {
+        return text.to_string();
+    }
+
+    let mut head = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let width = terminal_cell_width(ch) as usize;
+        if used + width > max {
+            break;
+        }
+        head.push(ch);
+        used += width;
+    }
+    head
 }
 
 fn clip_text_tail(text: &str, max: usize) -> String {

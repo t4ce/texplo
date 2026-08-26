@@ -1,55 +1,74 @@
-explorer_tui_v13
-================
+Texplo
+======
+
+Terminal directory explorer for native hosts. This `otheros` branch carries the
+portable UI and filesystem behavior developed in the TRUEOS application while
+using crossterm and the host filesystem.
 
 Run from this directory:
 
     cargo run
 
-Dependency policy: std + crossterm only.
+Open a particular directory:
 
-Diagnostic build marker (when diagnostics are enabled):
-    v0.13 · tombstone delete
+    cargo run -- --browse /path/to/open
+    cargo run -- /path/to/open
 
-Diagnostics are hidden by default so the graph and menu use the full terminal.
-Enable the six diagnostic rows only when needed:
-
-    cargo run -- --diagnostics
-
-Aliases: --diagnostic, --diag, -d
-Environment form: EXPLORER_DIAGNOSTICS=1 cargo run
-Use --no-diagnostics to override an enabled environment flag.
+Diagnostics are hidden by default. Enable the six diagnostic rows with
+`--diagnostics`, `--diagnostic`, `--diag`, `-d`, or `EXPLORER_DIAGNOSTICS=1`.
 
 Controls
 --------
-- LMB: select / drag one file or folder
+- LMB: select or drag a file/folder
 - MMB drag: pan
 - Arrow keys or W/A/S/D: pan
 - Home: center
-- Enter: enter selected folder
-- Tab / Shift+Tab: cycle Mount, View, Action
-- 0..9: run the local numbered entry in the active menu section
-- Mouse hover: move the menu cursor and activate that section
-- Drag onto a folder: confirm move
+- Enter: enter the selected folder
+- Tab / Shift+Tab: cycle Mount, View, Action, and Clip
+- 0..9: run the local numbered item in the active menu section
+- View zoom: cycle 75%, 100%, 125%, 150%, and 200%
+- Drag onto a folder or breadcrumb: confirm move
 - Drag into virtual columns 0, 1, or 2: confirm recycle move
-- Drag into the menu: add a session link (no filesystem move)
+- Drag into the menu: add a session Clip link
 - Click a folder link: mount it
-- Click a file link: mount its parent and select it when visible
+- Click a file link: mount its parent and select it
 - Y/N or mouse: confirmation modal
-- Enter/Esc: accept/cancel text-input modal
+- Enter/Esc: accept/cancel text input
+- Ctrl+Q or Esc: exit
 
-Rendering notes
----------------
-- A retained terminal-cell framebuffer repaints only changed runs while panning.
-- Braille connector geometry is cached in world space and only translated/clipped
-  during pan and terminal resize.
-- The edge cache is row-sorted, so pan only scans connector rows intersecting the
-  current viewport.
-- Bursts of drag/key-repeat events are coalesced before repainting.
-- Resize events are debounced; resize repaint does not clear the whole screen.
+Details carried over from TRUEOS
+--------------------------------
+- Compact 17-cell Mount/View/Action/Clip menu with selection statistics
+- Tree/radial layout, line-style, depth, spacing, zoom, and minimap controls
+- Clickable middle-dot breadcrumbs and drag-to-breadcrumb moves
+- New file/folder, rename, recycle, SHA-256, and retained move/delete markers
+- Directory-first case-insensitive sorting
+- Buffered retained-cell rendering, Unicode cell widths, resize debounce, and
+  coalesced input bursts
+- Folder subtrees retain a visual gap so hierarchy islands do not weld together
 
-Delete behavior
----------------
-- Confirmed delete moves the item to .explorer-trash/.
-- The current graph is not rescanned or re-laid out.
-- The deleted entry stays at the same position as `🪦 removed` until the next reload/mount/parent/depth refresh.
-- Removed folder descendants are hidden immediately and are non-interactive.
+Host notes
+----------
+- The Mount section exposes the current filesystem root. TRUEOSFS mount labels,
+  launch vFiles, terminal leases, and Shell2 lifecycle hooks do not exist here.
+- Zoom emits the same OSC 777 request used by TRUEOS. Terminals that do not
+  implement it safely ignore it.
+- 7z pack/unpack currently reports an unsupported-operation status in this host
+  build; TRUEOS provides that operation through its archive API.
+
+Delete and move behavior
+------------------------
+Confirmed delete moves an item to `.explorer-trash/`. Confirmed moves rename it
+on disk. The graph is not re-scanned or re-laid out immediately: the old entry
+stays in place as a non-interactive `🪦 removed` or `moved` marker until the next
+reload, mount, parent, or depth refresh, and folder descendants disappear at
+once.
+
+Nix
+---
+
+    nix run github:t4ce/texplo/otheros
+
+Use `--refresh` after the branch changes:
+
+    nix run --refresh github:t4ce/texplo/otheros
