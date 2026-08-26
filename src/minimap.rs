@@ -45,23 +45,12 @@ impl Minimap {
         terminal_width: u16,
         terminal_height: u16,
         viewport: Viewport,
-        minimum_width: u16,
-        minimum_height: u16,
     ) -> Option<MinimapGeometry> {
-        if terminal_width < minimum_width.saturating_mul(2)
-            || terminal_height < minimum_height.saturating_mul(2)
-        {
-            return None;
-        }
-
         // One fifth in both axes preserves the terminal's own rectangle aspect.
-        // At the 2x UI threshold this still leaves a useful Braille interior.
+        // Layout::current has already applied the application's sole
+        // terminal-too-small gate; the minimap follows that decision.
         let width = (terminal_width / 5).max(8).min(viewport.width);
         let height = (terminal_height / 5).max(5).min(viewport.height);
-        if width < 4 || height < 4 {
-            return None;
-        }
-
         Some(MinimapGeometry {
             x: viewport.x,
             y: viewport.bottom().saturating_sub(height),
@@ -102,21 +91,8 @@ impl Minimap {
         Some((world_x, world_y))
     }
 
-    pub fn draw(
-        &mut self,
-        frame: &mut Frame,
-        graph: &GraphView,
-        viewport: Viewport,
-        minimum_width: u16,
-        minimum_height: u16,
-    ) {
-        let Some(g) = Self::geometry(
-            frame.width(),
-            frame.height(),
-            viewport,
-            minimum_width,
-            minimum_height,
-        ) else {
+    pub fn draw(&mut self, frame: &mut Frame, graph: &GraphView, viewport: Viewport) {
+        let Some(g) = Self::geometry(frame.width(), frame.height(), viewport) else {
             return;
         };
 
