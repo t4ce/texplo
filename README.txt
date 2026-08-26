@@ -1,9 +1,10 @@
-TerminalDirectoryExplorer
-=========================
+<p align="center">
+  <img src="assets/termdir-logo.png" alt="termdir logo" width="360">
+</p>
 
-TDE is a terminal directory explorer for native hosts. This `otheros` branch
-carries the portable UI and filesystem behavior developed in the TRUEOS
-application while using crossterm and the host filesystem.
+termdir is a fast terminal directory explorer. Its short command is `td`.
+This `otheros` branch carries the portable UI and filesystem behavior developed
+in the TRUEOS application while using crossterm and the host filesystem.
 
 Run from this directory:
 
@@ -15,7 +16,7 @@ Open a particular directory:
     cargo run -- /path/to/open
 
 Diagnostics are hidden by default. Enable the six diagnostic rows with
-`--diagnostics`, `--diagnostic`, `--diag`, `-d`, or `EXPLORER_DIAGNOSTICS=1`.
+`--diagnostics`, `--diagnostic`, `--diag`, `-d`, or `TERMDIR_DIAGNOSTICS=1`.
 
 Controls
 --------
@@ -71,10 +72,10 @@ Nix
 
     nix run github:t4ce/texplo/otheros
 
-Install the `tde` command:
+Install the `td` command:
 
     nix profile install github:t4ce/texplo/otheros
-    tde
+    td
 
 Use `--refresh` after the branch changes:
 

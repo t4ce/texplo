@@ -1,5 +1,5 @@
 {
-  description = "TerminalDirectoryExplorer (TDE) - a fast terminal file browser.";
+  description = "termdir - a fast terminal directory explorer.";
   inputs = {
     nixpkgs.url = "nixpkgs";
     flake-parts.url = "github:hercules-ci/flake-parts";

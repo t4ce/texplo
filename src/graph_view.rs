@@ -1945,7 +1945,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root =
-            std::env::temp_dir().join(format!("texplo-graph-test-{}-{nonce}", std::process::id()));
+            std::env::temp_dir().join(format!("termdir-graph-test-{}-{nonce}", std::process::id()));
         let source = root.join("source.txt");
         let target = root.join("target");
         fs::create_dir_all(&target).unwrap();
@@ -1972,7 +1972,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "texplo-linked-move-test-{}-{nonce}",
+            "termdir-linked-move-test-{}-{nonce}",
             std::process::id()
         ));
         let outside = root.join("outside");

@@ -49,7 +49,7 @@ const TICK: Duration = Duration::from_millis(16);
 const MAX_EVENT_BATCH: usize = 64;
 const FRAME_OUTPUT_BUFFER_CAPACITY: usize = 64 * 1024;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(70);
-const BUILD_ID: &str = "TDE · v0.26 · pinned paths";
+const BUILD_ID: &str = "termdir · td · v0.26";
 const FALL_TICK: Duration = Duration::from_millis(90);
 const ZOOM_LEVELS: [u16; 5] = [75, 100, 125, 150, 200];
 const DEFAULT_ZOOM_STEP: usize = 1;
@@ -66,7 +66,8 @@ struct Config {
 
 impl Config {
     fn from_args() -> Self {
-        let mut diagnostics = env::var("EXPLORER_DIAGNOSTICS")
+        let mut diagnostics = env::var("TERMDIR_DIAGNOSTICS")
+            .or_else(|_| env::var("EXPLORER_DIAGNOSTICS"))
             .ok()
             .map(|value| {
                 matches!(
@@ -177,7 +178,7 @@ mod launch_script_tests {
     }
 
     #[test]
-    fn parses_tde_root_and_depth_defaults() {
+    fn parses_td_root_and_depth_defaults() {
         let directives = launch_directives_from_script("fs-scope trueosfs\nbrowse/\ndepth 2\n");
         assert_eq!(directives.browse_path, Some(PathBuf::from("/")));
         assert_eq!(directives.depth, Some(2));
@@ -185,13 +186,13 @@ mod launch_script_tests {
 
     #[test]
     fn breadcrumb_uses_middle_dots_without_legacy_slashes() {
-        let layout = breadcrumb_layout(Path::new("/apps/texplo"), 0, 80).unwrap();
+        let layout = breadcrumb_layout(Path::new("/apps/termdir"), 0, 80).unwrap();
         let labels: Vec<&str> = layout
             .crumbs
             .iter()
             .map(|crumb| crumb.label.as_str())
             .collect();
-        assert_eq!(labels, [BREADCRUMB_ROOT_LABEL, "apps", "texplo"]);
+        assert_eq!(labels, [BREADCRUMB_ROOT_LABEL, "apps", "termdir"]);
 
         let expected_width = labels
             .iter()
@@ -204,14 +205,14 @@ mod launch_script_tests {
 
     #[test]
     fn middle_dot_breadcrumb_widths_drive_positions_and_hit_boundaries() {
-        let layout = breadcrumb_layout(Path::new("/apps/texplo"), 0, 80).unwrap();
+        let layout = breadcrumb_layout(Path::new("/apps/termdir"), 0, 80).unwrap();
         let root = &layout.crumbs[0];
         let apps = &layout.crumbs[1];
-        let texplo = &layout.crumbs[2];
+        let termdir = &layout.crumbs[2];
 
         assert_eq!(text_cell_width(BREADCRUMB_SEPARATOR), 2);
         assert_eq!(apps.x, root.x + root.width + 2);
-        assert_eq!(texplo.x, apps.x + apps.width + 2);
+        assert_eq!(termdir.x, apps.x + apps.width + 2);
 
         assert_eq!(
             breadcrumb_path_at(&layout, root.x, false),
@@ -229,10 +230,10 @@ mod launch_script_tests {
             breadcrumb_path_at(&layout, apps.x, false),
             Some(PathBuf::from("/apps"))
         );
-        assert_eq!(breadcrumb_path_at(&layout, texplo.x, false), None);
+        assert_eq!(breadcrumb_path_at(&layout, termdir.x, false), None);
         assert_eq!(
-            breadcrumb_path_at(&layout, texplo.x + texplo.width - 1, true),
-            Some(PathBuf::from("/apps/texplo"))
+            breadcrumb_path_at(&layout, termdir.x + termdir.width - 1, true),
+            Some(PathBuf::from("/apps/termdir"))
         );
     }
 
