@@ -44,8 +44,10 @@ sudo snap alias termdir td
 td
 ```
 
-The Store icon is sourced from `assets/termdir-logo.png`. Update the listing
-metadata and icon from the reviewed package with:
+The 1254 px master logo is `assets/termdir-logo.png`. The Store-compatible
+512 px derivative is `snap/gui/icon.png`; regenerate it from the master rather
+than repeatedly resizing the derivative. Update the listing metadata and icon
+from the reviewed package with:
 
 ```sh
 snapcraft upload-metadata snap/termdir_0.14.0_amd64.snap --force

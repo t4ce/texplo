@@ -1,7 +1,7 @@
 name: termdir
 title: termdir
 version: '0.14.0'
-icon: assets/termdir-logo.png
+icon: snap/gui/icon.png
 summary: Fast terminal directory explorer
 description: |
   termdir is a fast visual directory explorer for the terminal. It presents the
