@@ -1,0 +1,56 @@
+name: termdir
+title: termdir
+version: '0.14.0'
+icon: assets/termdir-logo.png
+summary: Fast terminal directory explorer
+description: |
+  termdir is a fast visual directory explorer for the terminal. It presents the
+  filesystem as an interactive graph with tree and radial layouts, breadcrumbs,
+  a minimap, zoom controls, and a session Clip area for retaining and moving
+  references.
+
+  Files and folders can be selected, renamed, moved, recycled, and linked using
+  keyboard or mouse controls. The short command is `td` when its Snap alias is
+  enabled; `termdir` is always available.
+
+  Strict Snap confinement permits access to ordinary files in the user's home
+  directory. Access to mounted removable media can be enabled separately.
+license: BSD-2-Clause
+website: https://github.com/t4ce/texplo
+source-code: https://github.com/t4ce/texplo
+issues: https://github.com/t4ce/texplo/issues
+contact: https://github.com/t4ce/texplo/issues
+base: core26
+grade: stable
+confinement: strict
+compression: xz
+
+platforms:
+  amd64:
+
+apps:
+  termdir:
+    command: bin/td
+    aliases:
+      - td
+    plugs:
+      - home
+      - removable-media
+
+parts:
+  termdir:
+    plugin: rust
+    source: snap
+    source-type: local
+    rust-channel: '1.94.0'
+    override-pull: |
+      craftctl default
+      install -m644 "$CRAFT_PROJECT_DIR/Cargo.toml" "$CRAFT_PART_SRC/Cargo.toml"
+      install -m644 "$CRAFT_PROJECT_DIR/Cargo.lock" "$CRAFT_PART_SRC/Cargo.lock"
+      cp -a "$CRAFT_PROJECT_DIR/src" "$CRAFT_PART_SRC/src"
+    override-build: |
+      craftctl default
+      install -Dm644 "$CRAFT_PROJECT_DIR/snap/COPYRIGHT" \
+        "$CRAFT_PART_INSTALL/usr/share/doc/termdir/copyright"
+      install -Dm644 "$CRAFT_PROJECT_DIR/LICENSE" \
+        "$CRAFT_PART_INSTALL/usr/share/doc/termdir/LICENSE"

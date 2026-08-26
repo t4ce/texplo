@@ -8,6 +8,10 @@ in the TRUEOS application while using crossterm and the host filesystem.
 
 The project is distributed under the BSD 2-Clause license. See `LICENSE`.
 
+<a href="https://snapcraft.io/termdir">
+  <img alt="termdir" src="https://snapcraft.io/termdir/badge.svg" />
+</a>
+
 Run from this directory:
 
     cargo run
@@ -94,3 +98,21 @@ After termdir is accepted into Nixpkgs, the shorter commands will be:
 
 These commands are documented here for the packaging target; until the Nixpkgs
 change is merged, use the GitHub commands above.
+
+Snap
+----
+The Snap Store package name is `termdir`:
+
+    sudo snap install termdir
+    termdir
+
+The preferred short alias is `td`. Until the Store grants that automatic alias,
+enable it locally with:
+
+    sudo snap alias termdir td
+
+For removable drives, connect the optional interface:
+
+    sudo snap connect termdir:removable-media
+
+See `docs/SNAP_STORE.md` for confinement limits and the release procedure.

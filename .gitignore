@@ -1,3 +1,8 @@
 target/*
 flake/*
 result
+.craft/
+parts/
+prime/
+stage/
+snap/*.snap
