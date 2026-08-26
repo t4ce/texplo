@@ -82,7 +82,7 @@ pub fn run() -> io::Result<()> {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                let reason = format!("texplo handoff probe failed: {error}");
+                let reason = format!("termdir handoff probe failed: {error}");
                 let _ = trueos::vshell::report_exit_reason(reason.as_str());
                 let _ = lease.release_to_shell();
                 return Err(error);
@@ -91,7 +91,7 @@ pub fn run() -> io::Result<()> {
 
         match outcome {
             SessionExit::Shutdown => {
-                let _ = trueos::vshell::report_exit_reason("texplo handoff probe user exit");
+                let _ = trueos::vshell::report_exit_reason("termdir handoff probe user exit");
                 let _ticket = lease.release_to_shell().map_err(lease_io)?;
                 return Ok(());
             }
@@ -162,7 +162,7 @@ fn draw(out: &mut Stdout) -> io::Result<()> {
     )?;
 
     let lines = [
-        "TRUEOS · TEXplo terminal handoff probe",
+        "TRUEOS · termdir terminal handoff probe",
         "",
         "static demo target — filesystem/VFS modules are not compiled here",
         "",
@@ -170,7 +170,7 @@ fn draw(out: &mut Stdout) -> io::Result<()> {
         "       ╱    ╲",
         "    apps    system",
         "    ╱ ╲       ╲",
-        " texplo tui   net",
+        " termdir tui  net",
         "",
         "Esc     restore Crossterm + release lease to Shell2",
         "tui     from Shell2 requests re-entry into this same process",

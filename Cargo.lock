@@ -427,7 +427,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "terminal-directory-explorer"
+name = "termdir"
 version = "0.14.0"
 dependencies = [
  "crossterm",

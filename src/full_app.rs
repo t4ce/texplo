@@ -393,14 +393,14 @@ fn trueos_main() -> io::Result<()> {
         if let Err(error) = run_terminal_session(&mut app, || {
             lease.acknowledge_ready().map_err(terminal_lease_io)
         }) {
-            let reason = format!("texplo terminal session failed: {error}");
+            let reason = format!("termdir terminal session failed: {error}");
             let _ = trueos::vshell::report_exit_reason(reason.as_str());
             let _ = lease.release_to_shell();
             return Err(error);
         }
 
         if app.should_shutdown {
-            let _ = trueos::vshell::report_exit_reason("texplo user exit");
+            let _ = trueos::vshell::report_exit_reason("termdir user exit");
             let _ticket = lease.release_to_shell().map_err(terminal_lease_io)?;
             return Ok(());
         }
