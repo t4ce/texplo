@@ -43,7 +43,8 @@ Initial path
 
 Controls
 --------
-- LMB: select / drag one file or folder
+- LMB: click a file to toggle it into a same-folder file group; folders and
+  files from another folder start a new selection
 - MMB drag: pan
 - Arrow keys or W/A/S/D: pan
 - Home: center
@@ -53,14 +54,19 @@ Controls
 - Mount section: 0 refreshes; 1..9 open the listed TRUEOSFS roots
 - View `zoom`: cycles 75%, 100%, 125%, 150%, and 200% terminal text
 - Mouse hover: move the menu cursor and activate that section
-- Drag onto a folder: confirm move
-- Drag onto a visible top-path crumb: confirm move into that folder
+- Drag a selected file group onto a folder: confirm moving the whole group
+- Drag a selected file group onto a visible top-path crumb: confirm moving it
+  into that folder
 - Top path and bottom selection titles use centered `・・` rule bridges
-- Select a file and choose `sha ＃` for its cross-platform SHA-256 digest
+- `sha ＃` remains a single-file SHA-256 action; it is unavailable for groups
 - Select a file or folder and choose `7z 🗜` to pack it; selecting a `.7z`
   archive extracts it beside the archive using a collision-free output name
-- Drag into virtual columns 0, 1, or 2: confirm recycle move
-- Drag into the menu: add a session Clip link (no filesystem move)
+- Choose `7z 🗜` with a file group to bundle every selected file into a
+  collision-free `bundle.7z` in their shared folder
+- Drag a selected file group into virtual columns 0, 1, or 2: confirm recycling
+  the whole group
+- Drag a selected file group into the menu: pin every member as a session Clip
+  link (no filesystem move)
 - Click and release a folder link: mount it
 - Click and release a file link: mount its parent and select it when visible
 - Drag a Clip link onto a folder or breadcrumb: confirm moving the linked item
@@ -80,13 +86,14 @@ Rendering notes
 
 Delete behavior
 ---------------
-- Confirmed delete moves the item to .explorer-trash/.
+- Confirmed delete moves the item or selected file group to .explorer-trash/.
 - The current graph is not rescanned or re-laid out.
 - The deleted entry stays at the same position as `🪦 removed` until the next reload/mount/parent/depth refresh.
 - Removed folder descendants are hidden immediately and are non-interactive.
 
 Move behavior
 -------------
-- Confirmed moves rename the item on disk without rescanning or re-laying out the current graph.
+- Confirmed moves rename the item or selected file group on disk without
+  rescanning or re-laying out the current graph.
 - The old entry stays at the same position as `moved` until the next reload/mount/parent/depth refresh.
 - Moved folder descendants are hidden immediately and are non-interactive.

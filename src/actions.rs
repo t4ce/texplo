@@ -34,6 +34,7 @@ pub enum MenuCommand {
 pub enum MenuContext {
     None,
     File,
+    Files,
     Folder,
 }
 
@@ -361,15 +362,21 @@ impl MenuState {
             | MenuCommand::Zoom
             | MenuCommand::ToggleLayout
             | MenuCommand::Exit => true,
+            // A digest describes one byte stream. Multi-file selection leaves
+            // it unavailable rather than implying a made-up combined hash.
             MenuCommand::Sha256 => context == MenuContext::File,
             MenuCommand::Zip => context != MenuContext::None,
             MenuCommand::Enter => context == MenuContext::Folder,
             MenuCommand::NewFolder | MenuCommand::NewFile => {
                 matches!(context, MenuContext::None | MenuContext::Folder)
             }
-            MenuCommand::Delete | MenuCommand::Rename => {
-                matches!(context, MenuContext::File | MenuContext::Folder)
+            MenuCommand::Delete => {
+                matches!(
+                    context,
+                    MenuContext::File | MenuContext::Files | MenuContext::Folder
+                )
             }
+            MenuCommand::Rename => matches!(context, MenuContext::File | MenuContext::Folder),
             MenuCommand::Parent | MenuCommand::TreeLayout | MenuCommand::RadialLayout => false,
         }
     }
@@ -452,7 +459,7 @@ impl MenuState {
     }
 
     pub fn stats_header_row(context: MenuContext, mount_count: usize) -> Option<u16> {
-        if context == MenuContext::None {
+        if matches!(context, MenuContext::None | MenuContext::Files) {
             None
         } else {
             Some(Self::action_header_row(mount_count) + 2 + Self::action_count(context) as u16)
@@ -505,13 +512,41 @@ impl MenuState {
 
 #[derive(Clone, Debug)]
 pub enum PendingAction {
-    Move { source: usize, target: usize },
-    MoveToPath { source: usize, target: PathBuf },
-    MovePath { source: PathBuf, target: PathBuf },
-    Trash { source: usize },
-    NewFolder { parent: usize },
-    NewFile { parent: usize },
-    Rename { source: usize },
+    Move {
+        source: usize,
+        target: usize,
+    },
+    MoveNodes {
+        sources: Vec<usize>,
+        target: usize,
+    },
+    MoveToPath {
+        source: usize,
+        target: PathBuf,
+    },
+    MoveNodesToPath {
+        sources: Vec<usize>,
+        target: PathBuf,
+    },
+    MovePath {
+        source: PathBuf,
+        target: PathBuf,
+    },
+    Trash {
+        source: usize,
+    },
+    TrashNodes {
+        sources: Vec<usize>,
+    },
+    NewFolder {
+        parent: usize,
+    },
+    NewFile {
+        parent: usize,
+    },
+    Rename {
+        source: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -562,6 +597,37 @@ impl Modal {
         }
     }
 
+    pub fn move_nodes(graph: &GraphView, sources: Vec<usize>, target: usize) -> Self {
+        let count = sources.len();
+        Self {
+            pending: PendingAction::MoveNodes { sources, target },
+            title: "Confirm".to_string(),
+            lines: vec![
+                format!("Move {count} files"),
+                format!("into {} ?", graph.label(target)),
+            ],
+            mode: ModalMode::Confirm,
+            trash_origin_y: None,
+        }
+    }
+
+    pub fn move_nodes_to_path(sources: Vec<usize>, target: PathBuf) -> Self {
+        let count = sources.len();
+        Self {
+            pending: PendingAction::MoveNodesToPath {
+                sources,
+                target: target.clone(),
+            },
+            title: "Confirm".to_string(),
+            lines: vec![
+                format!("Move {count} files"),
+                format!("into {} ?", target.display()),
+            ],
+            mode: ModalMode::Confirm,
+            trash_origin_y: None,
+        }
+    }
+
     pub fn move_path(source: PathBuf, target: PathBuf) -> Self {
         let label = source
             .file_name()
@@ -588,6 +654,20 @@ impl Modal {
             title: "Confirm".to_string(),
             lines: vec![
                 format!("Move {} to recycle area?", graph.label(source)),
+                "Stored in .explorer-trash/".to_string(),
+            ],
+            mode: ModalMode::Confirm,
+            trash_origin_y: None,
+        }
+    }
+
+    pub fn trash_nodes(sources: Vec<usize>) -> Self {
+        let count = sources.len();
+        Self {
+            pending: PendingAction::TrashNodes { sources },
+            title: "Confirm".to_string(),
+            lines: vec![
+                format!("Move {count} files to recycle?"),
                 "Stored in .explorer-trash/".to_string(),
             ],
             mode: ModalMode::Confirm,
@@ -704,6 +784,16 @@ pub fn dispatch_menu(
     graph: &mut GraphView,
     selected: Option<usize>,
 ) -> io::Result<Dispatch> {
+    dispatch_menu_selected(command, graph, selected, &[])
+}
+
+pub fn dispatch_menu_selected(
+    command: MenuCommand,
+    graph: &mut GraphView,
+    selected: Option<usize>,
+    selected_files: &[usize],
+) -> io::Result<Dispatch> {
+    let selected = single_selected(selected, selected_files);
     match command {
         MenuCommand::Reload => {
             graph.reload()?;
@@ -774,6 +864,12 @@ pub fn dispatch_menu(
                 Ok(status) => status,
                 Err(err) => format!("7Z FAILED · {err}"),
             })),
+            None if !selected_files.is_empty() => Ok(Dispatch::Status(
+                match graph.archive_nodes(selected_files) {
+                    Ok(status) => status,
+                    Err(err) => format!("7Z FAILED · {err}"),
+                },
+            )),
             None => Ok(Dispatch::Status(
                 "7Z · select one file or folder first".to_string(),
             )),
@@ -796,6 +892,9 @@ pub fn dispatch_menu(
                 .unwrap_or(0);
             Ok(Dispatch::Modal(Modal::new_file(graph, parent)))
         }
+        MenuCommand::Delete if selected_files.len() > 1 => {
+            Ok(Dispatch::Modal(Modal::trash_nodes(selected_files.to_vec())))
+        }
         MenuCommand::Delete => match selected {
             None => Ok(Dispatch::Status(
                 "DELETE · select one file/folder first".to_string(),
@@ -803,6 +902,14 @@ pub fn dispatch_menu(
             Some(source) => Ok(Dispatch::Modal(Modal::trash_node(graph, source))),
         },
         MenuCommand::Exit => Ok(Dispatch::Exit),
+    }
+}
+
+fn single_selected(selected: Option<usize>, selected_files: &[usize]) -> Option<usize> {
+    match selected_files {
+        [] => selected,
+        [source] => Some(*source),
+        _ => None,
     }
 }
 
@@ -816,8 +923,22 @@ pub fn execute_modal(modal: Modal, graph: &mut GraphView) -> io::Result<ActionOu
                 trashed_label: None,
             })
         }
+        PendingAction::MoveNodes { sources, target } => {
+            let status = graph.move_nodes(sources.as_slice(), target)?;
+            Ok(ActionOutcome {
+                status,
+                trashed_label: None,
+            })
+        }
         PendingAction::MoveToPath { source, target } => {
             let status = graph.move_node_to_path(source, &target)?;
+            Ok(ActionOutcome {
+                status,
+                trashed_label: None,
+            })
+        }
+        PendingAction::MoveNodesToPath { sources, target } => {
+            let status = graph.move_nodes_to_path(sources.as_slice(), &target)?;
             Ok(ActionOutcome {
                 status,
                 trashed_label: None,
@@ -836,6 +957,13 @@ pub fn execute_modal(modal: Modal, graph: &mut GraphView) -> io::Result<ActionOu
             Ok(ActionOutcome {
                 status,
                 trashed_label: Some(label),
+            })
+        }
+        PendingAction::TrashNodes { sources } => {
+            let status = graph.trash_nodes(sources.as_slice())?;
+            Ok(ActionOutcome {
+                status,
+                trashed_label: Some(format!("{} files", sources.len())),
             })
         }
         PendingAction::NewFolder { parent } => {
@@ -1088,7 +1216,7 @@ fn print_at(frame: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MenuCommand, MenuContext, MenuState};
+    use super::{MenuCommand, MenuContext, MenuState, Modal, PendingAction};
 
     #[test]
     fn name_action_is_visible_and_clickable_for_files_and_folders() {
@@ -1099,5 +1227,26 @@ mod tests {
             assert_eq!(MenuState::index_for_row(row, context, 1), Some(index));
         }
         assert!(!MenuState::is_visible(index, MenuContext::None));
+    }
+
+    #[test]
+    fn file_group_exposes_only_group_safe_actions() {
+        let delete = MenuState::index_for_command(MenuCommand::Delete).unwrap();
+        let archive = MenuState::index_for_command(MenuCommand::Zip).unwrap();
+        let sha = MenuState::index_for_command(MenuCommand::Sha256).unwrap();
+        let rename = MenuState::index_for_command(MenuCommand::Rename).unwrap();
+
+        assert!(MenuState::is_visible(delete, MenuContext::Files));
+        assert!(MenuState::is_visible(archive, MenuContext::Files));
+        assert!(!MenuState::is_visible(sha, MenuContext::Files));
+        assert!(!MenuState::is_visible(rename, MenuContext::Files));
+        assert_eq!(MenuState::stats_header_row(MenuContext::Files, 1), None);
+    }
+
+    #[test]
+    fn group_recycle_confirmation_names_the_file_count() {
+        let modal = Modal::trash_nodes(vec![4, 9, 16]);
+        assert_eq!(modal.lines[0], "Move 3 files to recycle?");
+        assert!(matches!(modal.pending, PendingAction::TrashNodes { .. }));
     }
 }

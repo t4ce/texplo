@@ -1,5 +1,6 @@
-use crate::chronos::{Duration, SystemTime, elapsed_since};
+use crate::chronos::{SystemTime, elapsed_since};
 use std::{
+    collections::BTreeSet,
     io,
     path::{Path, PathBuf},
 };
@@ -1017,6 +1018,38 @@ impl GraphView {
         ))
     }
 
+    /// Bundle explicit regular files from one directory. A multi-file archive
+    /// intentionally uses the basename of every file as its archive entry;
+    /// the explorer only creates this selection inside one parent directory,
+    /// so every entry name is unique and extraction restores those siblings.
+    pub fn archive_nodes(&mut self, sources: &[usize]) -> io::Result<String> {
+        if sources.len() == 1 {
+            return self.archive_node(sources[0]);
+        }
+        let nodes = self.selected_regular_files(sources)?;
+        let parent = nodes[0].path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "selected file has no parent")
+        })?;
+        let destination = unique_archive_destination(&parent.join("bundle.7z"), true)?;
+        let source_paths: Vec<&str> = nodes
+            .iter()
+            .map(|node| path_to_utf8(&node.path))
+            .collect::<io::Result<_>>()?;
+        let source_bytes: Vec<&[u8]> = source_paths.iter().map(|path| path.as_bytes()).collect();
+        let destination = path_to_utf8(&destination)?;
+        let report = async_fs::block_on(trueos::archive::pack_many(
+            source_bytes.as_slice(),
+            destination.as_bytes(),
+        ))
+        .map_err(|error| trueos_fs_err("archive", error))?;
+
+        self.reload()?;
+        Ok(format!(
+            "7Z · {} · {} file(s) · {} → {} bytes",
+            destination, report.file_count, report.input_bytes, report.output_bytes
+        ))
+    }
+
     pub fn label(&self, id: usize) -> String {
         self.node(id)
             .map(|n| {
@@ -1082,7 +1115,17 @@ impl GraphView {
         y: u16,
         source: usize,
     ) -> Option<usize> {
-        if !viewport.contains(x, y) {
+        self.folder_drop_target_many(viewport, x, y, &[source])
+    }
+
+    pub fn folder_drop_target_many(
+        &self,
+        viewport: Viewport,
+        x: u16,
+        y: u16,
+        sources: &[usize],
+    ) -> Option<usize> {
+        if !viewport.contains(x, y) || sources.is_empty() {
             return None;
         }
 
@@ -1095,7 +1138,7 @@ impl GraphView {
                 || node.is_removed
                 || node.hidden
                 || !node.is_dir
-                || !self.can_move(source, node.id)
+                || !sources.iter().all(|source| self.can_move(*source, node.id))
             {
                 continue;
             }
@@ -1321,6 +1364,50 @@ impl GraphView {
         Ok(message)
     }
 
+    /// Move every selected regular file after checking all destinations before
+    /// the first rename. The filesystem currently exposes individual renames,
+    /// so this preflight is the strongest atomicity boundary available here.
+    pub fn move_nodes(&mut self, sources: &[usize], target: usize) -> io::Result<String> {
+        let nodes = self.selected_regular_files(sources)?;
+        if !sources.iter().all(|source| self.can_move(*source, target)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid file-group move",
+            ));
+        }
+        let target_node = self
+            .node(target)
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "target folder disappeared"))?;
+        let mut destination_set = BTreeSet::new();
+        let mut destinations = Vec::new();
+        destinations
+            .try_reserve_exact(nodes.len())
+            .map_err(|_| io::Error::other("move allocation failed"))?;
+        for source in &nodes {
+            let name = source.path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "source has no file name")
+            })?;
+            let destination = target_node.path.join(name);
+            if !destination_set.insert(destination.clone()) || trueos_exists(&destination)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} already exists in {}", source.name, target_node.name),
+                ));
+            }
+            destinations.push(destination);
+        }
+        for (source, destination) in nodes.iter().zip(destinations.iter()) {
+            trueos_rename(&source.path, destination)?;
+        }
+        self.mark_moved_nodes(sources);
+        Ok(format!(
+            "MOVE · {} files → {}",
+            sources.len(),
+            target_node.name
+        ))
+    }
+
     pub fn move_node_to_path(&mut self, source: usize, target: &Path) -> io::Result<String> {
         if !self.can_move_to_path(source, target) || !trueos_is_dir(target)? {
             return Err(io::Error::new(
@@ -1348,6 +1435,47 @@ impl GraphView {
         self.mark_moved(source);
         let message = format!("MOVE · {} → {}", src.name, target.display());
         Ok(message)
+    }
+
+    pub fn move_nodes_to_path(&mut self, sources: &[usize], target: &Path) -> io::Result<String> {
+        let nodes = self.selected_regular_files(sources)?;
+        if !sources
+            .iter()
+            .all(|source| self.can_move_to_path(*source, target))
+            || !trueos_is_dir(target)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid file-group move",
+            ));
+        }
+        let mut destination_set = BTreeSet::new();
+        let mut destinations = Vec::new();
+        destinations
+            .try_reserve_exact(nodes.len())
+            .map_err(|_| io::Error::other("move allocation failed"))?;
+        for source in &nodes {
+            let name = source.path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "source has no file name")
+            })?;
+            let destination = target.join(name);
+            if !destination_set.insert(destination.clone()) || trueos_exists(&destination)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} already exists in {}", source.name, target.display()),
+                ));
+            }
+            destinations.push(destination);
+        }
+        for (source, destination) in nodes.iter().zip(destinations.iter()) {
+            trueos_rename(&source.path, destination)?;
+        }
+        self.mark_moved_nodes(sources);
+        Ok(format!(
+            "MOVE · {} files → {}",
+            sources.len(),
+            target.display()
+        ))
     }
 
     pub fn move_path(&mut self, source: &Path, target: &Path) -> io::Result<String> {
@@ -1458,6 +1586,32 @@ impl GraphView {
         Ok(message)
     }
 
+    /// Recycle a file selection as one preflighted group. The existing
+    /// single-node delete continues to support folders; this batch operation
+    /// is deliberately file-only to match the explorer's selection contract.
+    pub fn trash_nodes(&mut self, sources: &[usize]) -> io::Result<String> {
+        let nodes = self.selected_regular_files(sources)?;
+        let trash = self.root.join(".explorer-trash");
+        async_fs::block_on(async_fs::create_dir_all(path_to_utf8(&trash)?.as_bytes()))
+            .map_err(|err| trueos_fs_err("create_dir_all", err))?;
+
+        let mut reserved = BTreeSet::new();
+        let mut destinations = Vec::new();
+        for source in &nodes {
+            let destination = self.next_trash_destination(source, &trash, &reserved)?;
+            reserved.insert(destination.clone());
+            destinations.push(destination);
+        }
+        for (source, destination) in nodes.iter().zip(destinations.iter()) {
+            trueos_rename(&source.path, destination)?;
+        }
+        self.mark_removed_nodes(sources);
+        Ok(format!(
+            "TRASH · {} files → .explorer-trash/",
+            sources.len()
+        ))
+    }
+
     // Keep the old node in its existing slot as a lightweight move marker until
     // the next explicit reload. This mirrors delete's retained tombstone update:
     // no directory scan or layout pass is needed, only the affected subtree and
@@ -1469,6 +1623,111 @@ impl GraphView {
         self.hide_descendants(source);
         self.rebuild_edge_cache();
         self.bump_scene_revision();
+    }
+
+    fn mark_moved_nodes(&mut self, sources: &[usize]) {
+        for source in sources {
+            if let Some(node) = self.nodes.get_mut(*source) {
+                node.is_moved = true;
+            }
+            self.hide_descendants(*source);
+        }
+        self.rebuild_edge_cache();
+        self.bump_scene_revision();
+    }
+
+    fn mark_removed_nodes(&mut self, sources: &[usize]) {
+        for source in sources {
+            if let Some(node) = self.nodes.get_mut(*source) {
+                node.is_removed = true;
+            }
+            self.hide_descendants(*source);
+        }
+        self.rebuild_edge_cache();
+        self.bump_scene_revision();
+    }
+
+    fn selected_regular_files(&self, sources: &[usize]) -> io::Result<Vec<FsNode>> {
+        if sources.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "select one or more files",
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        let mut parent = None;
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve_exact(sources.len())
+            .map_err(|_| io::Error::other("selection allocation failed"))?;
+        for source in sources {
+            if !ids.insert(*source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "selection contains the same file twice",
+                ));
+            }
+            let node = self.node(*source).cloned().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "selected file disappeared")
+            })?;
+            if node.is_placeholder || node.is_removed || node.is_moved || node.hidden || node.is_dir
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "select regular files from one folder",
+                ));
+            }
+            let node_parent = node.path.parent().map(Path::to_path_buf).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "selected file has no parent")
+            })?;
+            if parent.as_ref().is_some_and(|parent| parent != &node_parent) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "selected files must share one folder",
+                ));
+            }
+            parent = Some(node_parent);
+            nodes.push(node);
+        }
+        Ok(nodes)
+    }
+
+    fn next_trash_destination(
+        &self,
+        source: &FsNode,
+        trash: &Path,
+        reserved: &BTreeSet<PathBuf>,
+    ) -> io::Result<PathBuf> {
+        let original = source.path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "source has no file name")
+        })?;
+        for n in 1..10_000 {
+            let candidate = if n == 1 {
+                trash.join(original)
+            } else {
+                let stem = source
+                    .path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("item");
+                let ext = source
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str());
+                let name = match ext {
+                    Some(ext) if !source.is_dir => format!("{stem}.{n}.{ext}"),
+                    _ => format!("{stem}.{n}"),
+                };
+                trash.join(name)
+            };
+            if !reserved.contains(&candidate) && !trueos_exists(&candidate)? {
+                return Ok(candidate);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no available recycle name",
+        ))
     }
 
     fn hide_descendants(&mut self, ancestor: usize) {
@@ -1495,6 +1754,19 @@ impl GraphView {
         viewport: Viewport,
         selected: Option<usize>,
         drag_id: Option<usize>,
+        drop_target: Option<usize>,
+    ) {
+        let drag_sources = drag_id.as_slice();
+        self.render_many(frame, viewport, selected, &[], drag_sources, drop_target);
+    }
+
+    pub fn render_many(
+        &self,
+        frame: &mut Frame,
+        viewport: Viewport,
+        selected: Option<usize>,
+        selected_files: &[usize],
+        drag_sources: &[usize],
         drop_target: Option<usize>,
     ) {
         // Connector geometry is cached in world space whenever the directory,
@@ -1525,13 +1797,16 @@ impl GraphView {
             } else if node.is_dir {
                 style = Style::new(Color::Black, Color::White);
             }
-            if !node.is_removed && !node.is_moved && selected == Some(node.id) {
+            if !node.is_removed
+                && !node.is_moved
+                && (selected == Some(node.id) || selected_files.contains(&node.id))
+            {
                 style = Style::new(Color::Black, Color::DarkYellow);
             }
             if !node.is_removed && !node.is_moved && drop_target == Some(node.id) {
                 style = Style::new(Color::Black, Color::Cyan);
             }
-            if !node.is_removed && !node.is_moved && drag_id == Some(node.id) {
+            if !node.is_removed && !node.is_moved && drag_sources.contains(&node.id) {
                 style = Style::new(Color::DarkGrey, Color::Reset);
             }
 

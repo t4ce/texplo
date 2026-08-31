@@ -9,7 +9,7 @@ mod screen;
 use std::{
     collections::VecDeque,
     env,
-    io::{self, stdout, BufWriter},
+    io::{self, BufWriter, stdout},
     path::{Component, Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -17,8 +17,8 @@ use std::{
 use std::io::Write;
 
 use actions::{
-    dispatch_menu, draw_modal, execute_modal, modal_click, Dispatch, MenuContext, MenuLink,
-    MenuSection, MenuState, Modal, MountLink, PendingAction, MENU_ENTRIES,
+    Dispatch, MENU_ENTRIES, MenuContext, MenuLink, MenuSection, MenuState, Modal, MountLink,
+    PendingAction, dispatch_menu_selected, draw_modal, execute_modal, modal_click,
 };
 use crossterm::{
     cursor::{Hide, Show},
@@ -33,7 +33,7 @@ use crossterm::{
 use graph_view::{GraphView, SelectionStats, Sha256Result, Viewport};
 use menu_view::{close_button_hit, draw_menu, link_index_for_row};
 use minimap::Minimap;
-use screen::{terminal_cell_width, text_cell_width, Frame, Renderer, Style};
+use screen::{Frame, Renderer, Style, terminal_cell_width, text_cell_width};
 
 const DROP_X: u16 = 0;
 const DROP_HIT_WIDTH: u16 = 3; // virtual hit area: columns 0, 1, and 2
@@ -156,9 +156,10 @@ fn browse_path_from_script(script: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod launch_script_tests {
     use super::{
-        breadcrumb_layout, breadcrumb_path_at, browse_path_from_script, clip_text_head_cells,
+        BREADCRUMB_ROOT_LABEL, BREADCRUMB_SEPARATOR, Sha256Result, breadcrumb_layout,
+        breadcrumb_path_at, browse_path_from_script, clip_text_head_cells,
         launch_directives_from_script, sha256_rule_title, sha256_title_for_selection,
-        text_cell_width, Sha256Result, BREADCRUMB_ROOT_LABEL, BREADCRUMB_SEPARATOR,
+        text_cell_width,
     };
     use std::path::{Path, PathBuf};
 
@@ -272,7 +273,11 @@ mod launch_script_tests {
         );
         assert_eq!(
             sha256_title_for_selection(
-                Some((7, Path::new("/other/selected-file.txt"), "selected-file.txt")),
+                Some((
+                    7,
+                    Path::new("/other/selected-file.txt"),
+                    "selected-file.txt"
+                )),
                 Some(&result)
             ),
             Some(("selected-file.txt".to_string(), false))
@@ -363,9 +368,9 @@ struct Press {
     start_y: u16,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct DragState {
-    node: usize,
+    sources: Vec<usize>,
     x: u16,
     y: u16,
     target: Option<usize>,
@@ -412,6 +417,9 @@ struct FallingGhost {
 struct App {
     graph: GraphView,
     selected: Option<usize>,
+    /// A toggle-selected set of regular files that all share one immediate
+    /// parent. Folder selections continue to use `selected` alone.
+    selected_files: Vec<usize>,
     selected_stats: Option<SelectionStats>,
     selected_sha256: Option<Sha256Result>,
     path_hover: Option<PathBuf>,
@@ -458,6 +466,7 @@ impl App {
         Ok(Self {
             graph,
             selected: None,
+            selected_files: Vec::new(),
             selected_stats: None,
             selected_sha256: None,
             path_hover: None,
@@ -486,14 +495,66 @@ impl App {
     }
 
     fn set_selected(&mut self, selected: Option<usize>) -> bool {
-        let changed = self.selected != selected;
+        let changed = self.selected != selected || !self.selected_files.is_empty();
         self.selected = selected;
+        self.selected_files.clear();
         self.selected_stats = selected.and_then(|id| self.graph.selection_stats(id));
         if changed {
             self.selected_sha256 = None;
             self.mark_dirty();
         }
         changed
+    }
+
+    /// Apply a completed primary-button click. Re-clicking a regular file in
+    /// the same folder toggles it; selecting a folder or a file in another
+    /// folder starts a new selection.
+    fn select_node_on_click(&mut self, node_id: usize) -> bool {
+        let Some(node) = self.graph.node(node_id) else {
+            return self.set_selected(None);
+        };
+        if node.is_dir {
+            return self.set_selected(Some(node_id));
+        }
+        let parent = node.path.parent().map(Path::to_path_buf);
+        let can_toggle = parent.is_some()
+            && !self.selected_files.is_empty()
+            && self.selected_files.iter().all(|selected| {
+                self.graph
+                    .node(*selected)
+                    .and_then(|node| node.path.parent())
+                    == parent.as_deref()
+            });
+        let mut next = if can_toggle {
+            self.selected_files.clone()
+        } else {
+            Vec::new()
+        };
+        if let Some(index) = next.iter().position(|selected| *selected == node_id) {
+            next.remove(index);
+        } else {
+            next.push(node_id);
+        }
+        let primary = next.last().copied();
+        let changed = self.selected != primary || self.selected_files != next;
+        self.selected = primary;
+        self.selected_files = next;
+        self.selected_stats = (self.selected_files.len() == 1)
+            .then(|| self.selected_files[0])
+            .and_then(|id| self.graph.selection_stats(id));
+        self.selected_sha256 = None;
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    fn drag_sources_for(&self, node_id: usize) -> Vec<usize> {
+        if self.selected_files.contains(&node_id) {
+            self.selected_files.clone()
+        } else {
+            vec![node_id]
+        }
     }
 
     fn set_selected_sha256(&mut self, result: Sha256Result) {
@@ -517,6 +578,9 @@ impl App {
     }
 
     fn menu_context(&self) -> MenuContext {
+        if self.selected_files.len() > 1 {
+            return MenuContext::Files;
+        }
         match self.selected.and_then(|id| self.graph.node(id)) {
             Some(node) if node.is_dir => MenuContext::Folder,
             Some(_) => MenuContext::File,
@@ -845,7 +909,10 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> io::Resu
             }
         }
         KeyCode::Delete | KeyCode::Backspace => {
-            if let Some(source) = app.selected.filter(|id| *id != 0) {
+            if app.selected_files.len() > 1 {
+                app.modal = Some(Modal::trash_nodes(app.selected_files.clone()));
+                app.mark_dirty();
+            } else if let Some(source) = app.selected.filter(|id| *id != 0) {
                 let mut modal = Modal::trash_node(&app.graph, source);
                 if let Some(y) = selected_screen_y(app, source) {
                     modal = modal.with_origin_y(y);
@@ -1111,10 +1178,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                 }
             }
             if let Some(node) = app.graph.hit_test(layout.viewport, mouse.column, mouse.row) {
-                if app.selected != Some(node) {
-                    app.set_selected(Some(node));
-                    app.mark_dirty();
-                }
                 app.press = Some(Press {
                     node,
                     start_x: mouse.column,
@@ -1136,6 +1199,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                 let moved =
                     mouse.column.abs_diff(press.start_x) + mouse.row.abs_diff(press.start_y);
                 if moved >= 1 {
+                    let sources = app.drag_sources_for(press.node);
                     let over_menu =
                         mouse.column >= layout.menu_x && mouse.row <= layout.separator_y;
                     let over_trash = !over_menu
@@ -1147,29 +1211,35 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                     let path_target = if over_trash || over_menu || over_minimap || mouse.row != 0 {
                         None
                     } else {
-                        breadcrumb_drop_target_at(app, layout, mouse.column, press.node)
+                        breadcrumb_drop_target_at(app, layout, mouse.column, sources[0]).filter(
+                            |target| {
+                                sources.iter().all(|source| {
+                                    app.graph.can_move_to_path(*source, target.as_path())
+                                })
+                            },
+                        )
                     };
                     app.set_path_hover(path_target.clone());
                     let target = if over_trash || over_menu || over_minimap || path_target.is_some()
                     {
                         None
                     } else {
-                        app.graph.folder_drop_target(
+                        app.graph.folder_drop_target_many(
                             layout.viewport,
                             mouse.column,
                             mouse.row,
-                            press.node,
+                            sources.as_slice(),
                         )
                     };
                     let next_drag = DragState {
-                        node: press.node,
+                        sources,
                         x: mouse.column,
                         y: mouse.row,
                         target,
                         over_trash,
                         over_menu,
                     };
-                    if app.drag != Some(next_drag) {
+                    if app.drag.as_ref() != Some(&next_drag) {
                         app.drag = Some(next_drag);
                         app.mark_dirty();
                     }
@@ -1179,7 +1249,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         MouseEventKind::Up(_) => {
             if let Some(drag) = app.drag.take() {
                 let path_target = (mouse.row == 0)
-                    .then(|| breadcrumb_drop_target_at(app, layout, mouse.column, drag.node))
+                    .then(|| {
+                        breadcrumb_drop_target_at(app, layout, mouse.column, drag.sources[0])
+                            .filter(|target| {
+                                drag.sources.iter().all(|source| {
+                                    app.graph.can_move_to_path(*source, target.as_path())
+                                })
+                            })
+                    })
                     .flatten();
                 let dropped_in_menu = drag.over_menu
                     || (mouse.column >= layout.menu_x && mouse.row <= layout.separator_y);
@@ -1187,20 +1264,35 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                     && (drag.over_trash
                         || (is_trash_column(mouse.column) && mouse.row <= layout.separator_y));
                 if dropped_in_menu {
-                    add_link(app, drag.node);
+                    add_links(app, drag.sources.as_slice());
                 } else if dropped_in_trash {
-                    app.modal =
-                        Some(Modal::trash_node(&app.graph, drag.node).with_origin_y(mouse.row));
+                    app.modal = if drag.sources.len() == 1 {
+                        Some(
+                            Modal::trash_node(&app.graph, drag.sources[0]).with_origin_y(mouse.row),
+                        )
+                    } else {
+                        Some(Modal::trash_nodes(drag.sources))
+                    };
                     app.mark_dirty();
                 } else if let Some(target) = path_target {
-                    app.modal = Some(Modal::move_to_path(&app.graph, drag.node, target));
+                    app.modal = if drag.sources.len() == 1 {
+                        Some(Modal::move_to_path(&app.graph, drag.sources[0], target))
+                    } else {
+                        Some(Modal::move_nodes_to_path(drag.sources, target))
+                    };
                     app.mark_dirty();
                 } else if let Some(target) = drag.target {
-                    app.modal = Some(Modal::move_node(&app.graph, drag.node, target));
+                    app.modal = if drag.sources.len() == 1 {
+                        Some(Modal::move_node(&app.graph, drag.sources[0], target))
+                    } else {
+                        Some(Modal::move_nodes(&app.graph, drag.sources, target))
+                    };
                     app.mark_dirty();
                 } else {
                     app.log("MOVE · cancelled · target must be a valid folder");
                 }
+            } else if let Some(press) = app.press {
+                app.select_node_on_click(press.node);
             }
             app.set_path_hover(None);
             app.press = None;
@@ -1332,26 +1424,35 @@ fn minimap_hit(app: &App, layout: Layout, x: u16, y: u16) -> bool {
         .unwrap_or(false)
 }
 
-fn add_link(app: &mut App, node_id: usize) {
-    let Some(node) = app.graph.node(node_id) else {
-        return;
-    };
-    if node.is_placeholder {
+fn add_links(app: &mut App, node_ids: &[usize]) {
+    let mut added = 0usize;
+    for node_id in node_ids {
+        let Some(node) = app.graph.node(*node_id) else {
+            continue;
+        };
+        if node.is_placeholder || node.is_removed || node.is_moved {
+            continue;
+        }
+        let link = MenuLink {
+            path: node.path.clone(),
+            is_dir: node.is_dir,
+        };
+        app.links.retain(|existing| existing.path != link.path);
+        app.links.push(link);
+        added += 1;
+    }
+    if added == 0 {
         return;
     }
-    let link = MenuLink {
-        path: node.path.clone(),
-        is_dir: node.is_dir,
-    };
-    let status = format!("LINK · {}", link.path.display());
-    app.links.retain(|existing| existing.path != link.path);
-    app.links.push(link);
-    if app.links.len() > 10 {
-        app.links.remove(0);
+    // The Clip menu remains numbered 0..9, but never silently drops members
+    // of a selection merely because more than one local page is pinned.
+    app.menu
+        .set_clip_cursor(app.links.len().saturating_sub(1).min(9), app.links.len());
+    if added == 1 {
+        app.log("LINK · pinned");
+    } else {
+        app.log(format!("LINK · pinned {added} files"));
     }
-    let newest = app.links.len().saturating_sub(1);
-    app.menu.set_clip_cursor(newest, app.links.len());
-    app.log(status);
 }
 
 fn open_link(app: &mut App, index: usize) -> io::Result<()> {
@@ -1429,7 +1530,12 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
         // fails or no item is selected.
         app.clear_selected_sha256();
     }
-    match dispatch_menu(entry.command, &mut app.graph, app.selected)? {
+    match dispatch_menu_selected(
+        entry.command,
+        &mut app.graph,
+        app.selected,
+        app.selected_files.as_slice(),
+    )? {
         Dispatch::Exit => app.should_exit = true,
         Dispatch::Zoom => cycle_terminal_zoom(app)?,
         Dispatch::Modal(mut modal) => {
@@ -1628,18 +1734,23 @@ fn compose_frame(app: &mut App) -> io::Result<Frame> {
     draw_canvas_frame(&mut frame, layout.canvas_bottom_y);
     draw_dropzone(&mut frame, app, layout);
 
-    let drag_id = app.drag.map(|drag| drag.node);
-    let drop_target = app.drag.and_then(|drag| drag.target).or_else(|| {
+    let drag_sources = app
+        .drag
+        .as_ref()
+        .map(|drag| drag.sources.as_slice())
+        .unwrap_or(&[]);
+    let drop_target = app.drag.as_ref().and_then(|drag| drag.target).or_else(|| {
         app.clip_drag
             .as_ref()
             .and_then(|drag| drag.target.as_deref())
             .and_then(|path| app.graph.find_node_by_path(path))
     });
-    app.graph.render(
+    app.graph.render_many(
         &mut frame,
         layout.viewport,
         app.selected,
-        drag_id,
+        app.selected_files.as_slice(),
+        drag_sources,
         drop_target,
     );
 
@@ -1647,7 +1758,7 @@ fn compose_frame(app: &mut App) -> io::Result<Frame> {
         app.minimap.draw(&mut frame, &app.graph, layout.viewport);
     }
 
-    if let Some(drag) = app.drag {
+    if let Some(drag) = app.drag.as_ref() {
         draw_drag_box(&mut frame, app, drag, layout);
     }
     if let Some(drag) = app.clip_drag.as_ref() {
@@ -1921,14 +2032,19 @@ fn draw_canvas_frame(frame: &mut Frame, bottom_y: u16) {
 fn draw_dropzone(frame: &mut Frame, app: &App, layout: Layout) {
     // The delete target remains a virtual 3-column hit area. Hover does not
     // repaint boxes/backgrounds: only the dragged file/folder glyph appears.
-    if let Some((y, icon)) = app.drag.filter(|drag| drag.over_trash).and_then(|drag| {
-        app.graph.node(drag.node).map(|node| {
-            (
-                drag.y.clamp(1, layout.canvas_bottom_y),
-                if node.is_dir { "🖿" } else { "🖹" },
-            )
+    if let Some((y, icon)) = app
+        .drag
+        .as_ref()
+        .filter(|drag| drag.over_trash)
+        .and_then(|drag| {
+            app.graph.node(drag.sources[0]).map(|node| {
+                (
+                    drag.y.clamp(1, layout.canvas_bottom_y),
+                    if node.is_dir { "🖿" } else { "🖹" },
+                )
+            })
         })
-    }) {
+    {
         print_at(
             frame,
             DROP_X,
@@ -1947,17 +2063,21 @@ fn draw_dropzone(frame: &mut Frame, app: &App, layout: Layout) {
     );
 }
 
-fn draw_drag_box(frame: &mut Frame, app: &App, drag: DragState, layout: Layout) {
-    let Some(node) = app.graph.node(drag.node) else {
+fn draw_drag_box(frame: &mut Frame, app: &App, drag: &DragState, layout: Layout) {
+    let Some(node) = app.graph.node(drag.sources[0]) else {
         return;
     };
-
+    let name = if drag.sources.len() == 1 {
+        node.name.as_str().to_string()
+    } else {
+        format!("{} files", drag.sources.len())
+    };
     draw_named_drag_box(
         frame,
         drag.x,
         drag.y,
-        node.name.as_str(),
-        node.is_dir,
+        name.as_str(),
+        drag.sources.len() == 1 && node.is_dir,
         layout,
     );
 }
@@ -2033,6 +2153,19 @@ fn draw_falling(frame: &mut Frame, falling: &FallingGhost, layout: Layout) {
 }
 
 fn draw_bottom_rule(frame: &mut Frame, app: &App, menu_x: u16, y: u16) {
+    if app.selected_files.len() > 1 {
+        draw_rule_title(
+            frame,
+            FRAME_X,
+            y,
+            menu_x,
+            &format!("{} files", app.selected_files.len()),
+            "🞁",
+            "🞃",
+            false,
+        );
+        return;
+    }
     let selected = app.selected.and_then(|id| {
         app.graph
             .node(id)
