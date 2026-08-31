@@ -163,6 +163,40 @@ pub struct SelectionStats {
     pub size: String,
     pub modified: String,
     pub access: String,
+    pub content_type: String,
+}
+
+pub fn format_content_type(id: trueos::content_identity::ContentTypeId) -> String {
+    let raw = id.raw();
+    let identity = format!("0x{raw:08x} ({raw})");
+    match trueos::content_identity::content_type_info(id) {
+        Some(info) => format!("{identity} {} {} [registered]", info.canonical_name, info.mime_type),
+        None if raw == 0 => format!("{identity} NONE [unregistered]"),
+        None => format!("{identity} FUTURE/UNKNOWN [unregistered]"),
+    }
+}
+
+#[cfg(test)]
+mod content_type_tests {
+    use super::format_content_type;
+    use trueos::content_identity::ContentTypeId;
+
+    #[test]
+    fn renders_registered_identity_without_guessing() {
+        let rendered = format_content_type(ContentTypeId::UTF8_TEXT);
+        assert!(rendered.contains("0x00000002 (2)"));
+        assert!(rendered.contains("UTF8_TEXT"));
+        assert!(rendered.contains("text/plain"));
+        assert!(rendered.contains("registered"));
+    }
+
+    #[test]
+    fn distinguishes_none_and_future_raw_identities() {
+        assert!(format_content_type(ContentTypeId::NONE).contains("NONE [unregistered]"));
+        let future = format_content_type(ContentTypeId::from_raw(0xfeed_beef));
+        assert!(future.contains("0xfeedbeef (4276993775)"));
+        assert!(future.contains("FUTURE/UNKNOWN [unregistered]"));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,7 +457,7 @@ impl GraphView {
         let path = dir.to_str().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8")
         })?;
-        let listing = async_fs::block_on(async_fs::list_dir(path.as_bytes()))
+        let listing = async_fs::block_on(async_fs::list_dir_typed(path.as_bytes()))
             .map_err(|err| io::Error::other(format!("list_dir failed ({err})")))?;
         for entry in listing.entries {
             if entry.name == ".explorer-trash" {
@@ -841,7 +875,7 @@ impl GraphView {
         }
 
         let metadata = match path_to_utf8(&node.path) {
-            Ok(node_path) => async_fs::block_on(async_fs::metadata(node_path.as_bytes())).ok(),
+            Ok(node_path) => async_fs::block_on(async_fs::typed_metadata(node_path.as_bytes())).ok(),
             Err(_) => None,
         };
 
@@ -858,6 +892,10 @@ impl GraphView {
             size,
             modified,
             access,
+            content_type: metadata
+                .as_ref()
+                .map(|meta| format_content_type(meta.content_type))
+                .unwrap_or_else(|| "unavailable".to_string()),
         })
     }
 

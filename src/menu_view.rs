@@ -151,7 +151,7 @@ pub fn draw_menu(
 
     if let (Some(header), Some(stats)) = (MenuState::stats_header_row(context, mount_count), stats)
     {
-        if header + 5 < bottom {
+        if header + 6 < bottom {
             menu_line(frame, menu_x, header, "├─╼ Stats      ╾┤");
             let rows = [
                 ("key", stats.key.as_str()),
@@ -159,6 +159,7 @@ pub fn draw_menu(
                 ("kind", stats.kind.as_str()),
                 ("mod", stats.modified.as_str()),
                 ("mode", stats.access.as_str()),
+                ("type", stats.content_type.as_str()),
             ];
             for (offset, (key, value)) in rows.iter().enumerate() {
                 menu_line(
