@@ -2,7 +2,7 @@ use crate::{
     actions::{
         MENU_ENTRIES, MenuCommand, MenuContext, MenuLink, MenuSection, MenuState, MountLink,
     },
-    graph_view::{LineStyle, SelectionStats},
+    graph_view::{ContentTypeDisplay, LineStyle, SelectionStats},
     layout::LayoutMode,
     screen::{Frame, Style, text_cell_width},
 };
@@ -151,7 +151,7 @@ pub fn draw_menu(
 
     if let (Some(header), Some(stats)) = (MenuState::stats_header_row(context, mount_count), stats)
     {
-        if header + 6 < bottom {
+        if header < bottom {
             menu_line(frame, menu_x, header, "├─╼ Stats      ╾┤");
             let rows = [
                 ("key", stats.key.as_str()),
@@ -159,9 +159,9 @@ pub fn draw_menu(
                 ("kind", stats.kind.as_str()),
                 ("mod", stats.modified.as_str()),
                 ("mode", stats.access.as_str()),
-                ("type", stats.content_type.as_str()),
             ];
-            for (offset, (key, value)) in rows.iter().enumerate() {
+            let available = bottom.saturating_sub(header + 1) as usize;
+            for (offset, (key, value)) in rows.iter().enumerate().take(available) {
                 menu_line(
                     frame,
                     menu_x,
@@ -169,8 +169,20 @@ pub fn draw_menu(
                     &stats_line(key, value),
                 );
             }
-            if header + 6 < bottom {
-                menu_line(frame, menu_x, header + 6, blank);
+            for (offset, (key, value)) in content_type_lines(&stats.content_type)
+                .iter()
+                .enumerate()
+                .take(available.saturating_sub(rows.len()))
+            {
+                menu_line(
+                    frame,
+                    menu_x,
+                    header + 6 + offset as u16,
+                    &stats_line(key, value),
+                );
+            }
+            if header + 16 < bottom {
+                menu_line(frame, menu_x, header + 16, blank);
             }
         }
     }
@@ -242,6 +254,65 @@ fn stats_line(key: &str, value: &str) -> String {
     let key = pad_cells(&clip_cells(key, 5), 5);
     let value = pad_cells(&clip_cells(value, 10), 10);
     format!("│{key}{value}│")
+}
+
+/// Keep each durable identity component inspectable in the 15-column stats
+/// value cell. The source string is produced from typed metadata; this only
+/// lays it out and never derives anything from names or bytes.
+fn content_type_lines(value: &ContentTypeDisplay) -> Vec<(String, String)> {
+    let mut lines = Vec::new();
+    append_wrapped_stats_value(&mut lines, "id", value.raw_hex.as_str());
+    append_wrapped_stats_value(&mut lines, "raw", value.decimal.as_str());
+    append_wrapped_stats_value(&mut lines, "name", value.canonical_name.as_str());
+    append_wrapped_stats_value(&mut lines, "mime", value.mime.as_str());
+    append_wrapped_stats_value(&mut lines, "state", value.status.as_str());
+    lines
+}
+
+fn append_wrapped_stats_value(lines: &mut Vec<(String, String)>, key: &str, value: &str) {
+    // Registry descriptors are ASCII. Keeping the split at the same ten-byte
+    // boundary as `stats_line` makes every byte visible without ellipses.
+    let mut chunks = value.as_bytes().chunks(10).peekable();
+    if chunks.peek().is_none() {
+        lines.push((key.to_string(), String::new()));
+        return;
+    }
+    for (index, chunk) in chunks.enumerate() {
+        lines.push((
+            if index == 0 { key } else { "" }.to_string(),
+            String::from_utf8_lossy(chunk).into_owned(),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod typed_stats_tests {
+    use super::{ContentTypeDisplay, content_type_lines};
+
+    #[test]
+    fn lays_out_all_identity_fields_without_clipping() {
+        assert_eq!(
+            content_type_lines(&ContentTypeDisplay {
+                raw_hex: "0x00000002".into(),
+                decimal: "2".into(),
+                canonical_name: "TTF_LONG_NAME".into(),
+                mime: "application/font-sfnt".into(),
+                status: "registered".into(),
+            }),
+            vec![
+                ("id", "0x00000002"),
+                ("raw", "2"),
+                ("name", "TTF_LONG_N"),
+                ("", "AME"),
+                ("mime", "applicatio"),
+                ("", "n/font-sfnt"),
+                ("state", "registered")
+            ]
+            .into_iter()
+            .map(|(key, value)| (String::from(key), String::from(value)))
+            .collect::<Vec<_>>()
+        );
+    }
 }
 
 fn draw_links(

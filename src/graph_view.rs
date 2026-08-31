@@ -1,4 +1,4 @@
-use crate::chronos::{elapsed_since, Duration, SystemTime};
+use crate::chronos::{Duration, SystemTime, elapsed_since};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     layout::{self, LayoutMode, LayoutNode, WorldPos},
-    screen::{terminal_cell_width, text_cell_width, Frame, Style},
+    screen::{Frame, Style, terminal_cell_width, text_cell_width},
 };
 
 const HARD_MAX_DEPTH: usize = 256;
@@ -163,16 +163,42 @@ pub struct SelectionStats {
     pub size: String,
     pub modified: String,
     pub access: String,
-    pub content_type: String,
+    pub content_type: ContentTypeDisplay,
 }
 
-pub fn format_content_type(id: trueos::content_identity::ContentTypeId) -> String {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentTypeDisplay {
+    pub raw_hex: String,
+    pub decimal: String,
+    pub canonical_name: String,
+    pub mime: String,
+    pub status: String,
+}
+
+pub fn format_content_type(id: trueos::content_identity::ContentTypeId) -> ContentTypeDisplay {
     let raw = id.raw();
-    let identity = format!("0x{raw:08x} ({raw})");
     match trueos::content_identity::content_type_info(id) {
-        Some(info) => format!("{identity} {} {} [registered]", info.canonical_name, info.mime_type),
-        None if raw == 0 => format!("{identity} NONE [unregistered]"),
-        None => format!("{identity} FUTURE/UNKNOWN [unregistered]"),
+        Some(info) => ContentTypeDisplay {
+            raw_hex: format!("0x{raw:08x}"),
+            decimal: raw.to_string(),
+            canonical_name: info.canonical_name.to_string(),
+            mime: info.mime_type.to_string(),
+            status: "registered".to_string(),
+        },
+        None if raw == 0 => ContentTypeDisplay {
+            raw_hex: format!("0x{raw:08x}"),
+            decimal: raw.to_string(),
+            canonical_name: "NONE".to_string(),
+            mime: "application/octet-stream".to_string(),
+            status: "unregistered".to_string(),
+        },
+        None => ContentTypeDisplay {
+            raw_hex: format!("0x{raw:08x}"),
+            decimal: raw.to_string(),
+            canonical_name: "FUTURE/UNKNOWN".to_string(),
+            mime: "application/octet-stream".to_string(),
+            status: "future".to_string(),
+        },
     }
 }
 
@@ -184,18 +210,23 @@ mod content_type_tests {
     #[test]
     fn renders_registered_identity_without_guessing() {
         let rendered = format_content_type(ContentTypeId::UTF8_TEXT);
-        assert!(rendered.contains("0x00000002 (2)"));
-        assert!(rendered.contains("UTF8_TEXT"));
-        assert!(rendered.contains("text/plain"));
-        assert!(rendered.contains("registered"));
+        assert_eq!(rendered.raw_hex, "0x00000002");
+        assert_eq!(rendered.decimal, "2");
+        assert_eq!(rendered.canonical_name, "UTF8_TEXT");
+        assert_eq!(rendered.mime, "text/plain");
+        assert_eq!(rendered.status, "registered");
     }
 
     #[test]
     fn distinguishes_none_and_future_raw_identities() {
-        assert!(format_content_type(ContentTypeId::NONE).contains("NONE [unregistered]"));
+        assert_eq!(
+            format_content_type(ContentTypeId::NONE).status,
+            "unregistered"
+        );
         let future = format_content_type(ContentTypeId::from_raw(0xfeed_beef));
-        assert!(future.contains("0xfeedbeef (4276993775)"));
-        assert!(future.contains("FUTURE/UNKNOWN [unregistered]"));
+        assert_eq!(future.raw_hex, "0xfeedbeef");
+        assert_eq!(future.decimal, "4276993775");
+        assert_eq!(future.status, "future");
     }
 }
 
@@ -875,7 +906,9 @@ impl GraphView {
         }
 
         let metadata = match path_to_utf8(&node.path) {
-            Ok(node_path) => async_fs::block_on(async_fs::typed_metadata(node_path.as_bytes())).ok(),
+            Ok(node_path) => {
+                async_fs::block_on(async_fs::typed_metadata(node_path.as_bytes())).ok()
+            }
             Err(_) => None,
         };
 
@@ -895,7 +928,13 @@ impl GraphView {
             content_type: metadata
                 .as_ref()
                 .map(|meta| format_content_type(meta.content_type))
-                .unwrap_or_else(|| "unavailable".to_string()),
+                .unwrap_or_else(|| ContentTypeDisplay {
+                    raw_hex: "?".to_string(),
+                    decimal: "?".to_string(),
+                    canonical_name: "unavailable".to_string(),
+                    mime: "?".to_string(),
+                    status: "unknown".to_string(),
+                }),
         })
     }
 

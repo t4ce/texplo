@@ -461,8 +461,9 @@ impl MenuState {
 
     pub fn fixed_content_bottom(context: MenuContext, mount_count: usize) -> u16 {
         match Self::stats_header_row(context, mount_count) {
-            // Stats header + five values + one breathing row.
-            Some(header) => header + 6,
+            // Stats header + five ordinary values + up to ten wrapped
+            // typed-identity rows + one breathing row.
+            Some(header) => header + 16,
             // Action list + one breathing row.
             None => Self::action_header_row(mount_count) + 1 + Self::action_count(context) as u16,
         }
