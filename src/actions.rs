@@ -21,6 +21,7 @@ pub enum MenuCommand {
     Zoom,
     Center,
     Enter,
+    Show,
     Sha256,
     Zip,
     Rename,
@@ -34,8 +35,11 @@ pub enum MenuCommand {
 pub enum MenuContext {
     None,
     File,
+    ImageFile,
     Files,
+    ImageFiles,
     Folder,
+    ImageFolder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +76,7 @@ pub struct MenuEntry {
 
 // The visual order is the contract from ☰enu_Rework.txt. Local hotkeys are
 // assigned after contextual filtering, so every section reuses 🯰..🯹/0..9.
-pub const MENU_ENTRIES: [MenuEntry; 14] = [
+pub const MENU_ENTRIES: [MenuEntry; 15] = [
     MenuEntry {
         label: "center",
         command: MenuCommand::Center,
@@ -106,6 +110,11 @@ pub const MENU_ENTRIES: [MenuEntry; 14] = [
     MenuEntry {
         label: "enter",
         command: MenuCommand::Enter,
+        section: MenuSection::Action,
+    },
+    MenuEntry {
+        label: "show",
+        command: MenuCommand::Show,
         section: MenuSection::Action,
     },
     MenuEntry {
@@ -364,19 +373,37 @@ impl MenuState {
             | MenuCommand::Exit => true,
             // A digest describes one byte stream. Multi-file selection leaves
             // it unavailable rather than implying a made-up combined hash.
-            MenuCommand::Sha256 => context == MenuContext::File,
+            MenuCommand::Sha256 => matches!(context, MenuContext::File | MenuContext::ImageFile),
             MenuCommand::Zip => context != MenuContext::None,
-            MenuCommand::Enter => context == MenuContext::Folder,
+            MenuCommand::Enter => matches!(context, MenuContext::Folder | MenuContext::ImageFolder),
+            MenuCommand::Show => matches!(
+                context,
+                MenuContext::ImageFile | MenuContext::ImageFiles | MenuContext::ImageFolder
+            ),
             MenuCommand::NewFolder | MenuCommand::NewFile => {
-                matches!(context, MenuContext::None | MenuContext::Folder)
+                matches!(
+                    context,
+                    MenuContext::None | MenuContext::Folder | MenuContext::ImageFolder
+                )
             }
             MenuCommand::Delete => {
                 matches!(
                     context,
-                    MenuContext::File | MenuContext::Files | MenuContext::Folder
+                    MenuContext::File
+                        | MenuContext::ImageFile
+                        | MenuContext::Files
+                        | MenuContext::ImageFiles
+                        | MenuContext::Folder
+                        | MenuContext::ImageFolder
                 )
             }
-            MenuCommand::Rename => matches!(context, MenuContext::File | MenuContext::Folder),
+            MenuCommand::Rename => matches!(
+                context,
+                MenuContext::File
+                    | MenuContext::ImageFile
+                    | MenuContext::Folder
+                    | MenuContext::ImageFolder
+            ),
             MenuCommand::Parent | MenuCommand::TreeLayout | MenuCommand::RadialLayout => false,
         }
     }
@@ -459,7 +486,10 @@ impl MenuState {
     }
 
     pub fn stats_header_row(context: MenuContext, mount_count: usize) -> Option<u16> {
-        if matches!(context, MenuContext::None | MenuContext::Files) {
+        if matches!(
+            context,
+            MenuContext::None | MenuContext::Files | MenuContext::ImageFiles
+        ) {
             None
         } else {
             Some(Self::action_header_row(mount_count) + 2 + Self::action_count(context) as u16)
@@ -769,6 +799,7 @@ impl Modal {
 pub enum Dispatch {
     Exit,
     Zoom,
+    Show(Vec<String>),
     Modal(Modal),
     Sha256(Sha256Result),
     Status(String),
@@ -849,6 +880,10 @@ pub fn dispatch_menu_selected(
             _ => Ok(Dispatch::Status(
                 "ENTER · select a folder first".to_string(),
             )),
+        },
+        MenuCommand::Show => match graph.image_paths_for_selection(selected, selected_files) {
+            Ok(paths) => Ok(Dispatch::Show(paths)),
+            Err(error) => Ok(Dispatch::Status(format!("SHOW FAILED · {error}"))),
         },
         MenuCommand::Sha256 => match selected {
             Some(source) => match graph.sha256_node(source) {
@@ -1241,6 +1276,26 @@ mod tests {
         assert!(!MenuState::is_visible(sha, MenuContext::Files));
         assert!(!MenuState::is_visible(rename, MenuContext::Files));
         assert_eq!(MenuState::stats_header_row(MenuContext::Files, 1), None);
+    }
+
+    #[test]
+    fn show_is_only_visible_for_typed_image_selections() {
+        let show = MenuState::index_for_command(MenuCommand::Show).unwrap();
+        for context in [
+            MenuContext::ImageFile,
+            MenuContext::ImageFiles,
+            MenuContext::ImageFolder,
+        ] {
+            assert!(MenuState::is_visible(show, context));
+        }
+        for context in [
+            MenuContext::None,
+            MenuContext::File,
+            MenuContext::Files,
+            MenuContext::Folder,
+        ] {
+            assert!(!MenuState::is_visible(show, context));
+        }
     }
 
     #[test]

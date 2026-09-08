@@ -59,6 +59,9 @@ Controls
   into that folder
 - Top path and bottom selection titles use centered `・・` rule bridges
 - `sha ＃` remains a single-file SHA-256 action; it is unavailable for groups
+- `show` appears only for inferred PNG/JPEG files, same-folder image groups,
+  or folders containing an inferred PNG/JPEG. It launches one new resident
+  img instance; groups open one fixed UI4 frame per selected file.
 - Select a file or folder and choose `7z 🗜` to pack it; selecting a `.7z`
   archive extracts it beside the archive using a collision-free output name
 - Choose `7z 🗜` with a file group to bundle every selected file into a

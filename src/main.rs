@@ -422,6 +422,7 @@ struct App {
     selected_files: Vec<usize>,
     selected_stats: Option<SelectionStats>,
     selected_sha256: Option<Sha256Result>,
+    show_paths: Vec<String>,
     path_hover: Option<PathBuf>,
     press: Option<Press>,
     drag: Option<DragState>,
@@ -469,6 +470,7 @@ impl App {
             selected_files: Vec::new(),
             selected_stats: None,
             selected_sha256: None,
+            show_paths: Vec::new(),
             path_hover: None,
             press: None,
             drag: None,
@@ -499,6 +501,10 @@ impl App {
         self.selected = selected;
         self.selected_files.clear();
         self.selected_stats = selected.and_then(|id| self.graph.selection_stats(id));
+        self.show_paths = self
+            .graph
+            .image_paths_for_selection(selected, &[])
+            .unwrap_or_default();
         if changed {
             self.selected_sha256 = None;
             self.mark_dirty();
@@ -542,6 +548,10 @@ impl App {
         self.selected_stats = (self.selected_files.len() == 1)
             .then(|| self.selected_files[0])
             .and_then(|id| self.graph.selection_stats(id));
+        self.show_paths = self
+            .graph
+            .image_paths_for_selection(self.selected, self.selected_files.as_slice())
+            .unwrap_or_default();
         self.selected_sha256 = None;
         if changed {
             self.mark_dirty();
@@ -579,10 +589,16 @@ impl App {
 
     fn menu_context(&self) -> MenuContext {
         if self.selected_files.len() > 1 {
-            return MenuContext::Files;
+            return if self.show_paths.is_empty() {
+                MenuContext::Files
+            } else {
+                MenuContext::ImageFiles
+            };
         }
         match self.selected.and_then(|id| self.graph.node(id)) {
+            Some(node) if node.is_dir && !self.show_paths.is_empty() => MenuContext::ImageFolder,
             Some(node) if node.is_dir => MenuContext::Folder,
+            Some(_) if !self.show_paths.is_empty() => MenuContext::ImageFile,
             Some(_) => MenuContext::File,
             None => MenuContext::None,
         }
@@ -1538,6 +1554,10 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
     )? {
         Dispatch::Exit => app.should_exit = true,
         Dispatch::Zoom => cycle_terminal_zoom(app)?,
+        Dispatch::Show(paths) => match trueos::vshell::open_images(paths.as_slice()) {
+            Ok(()) => app.log(format!("SHOW · opening {} image source(s)", paths.len())),
+            Err(error) => app.log(format!("SHOW FAILED · host request code={error}")),
+        },
         Dispatch::Modal(mut modal) => {
             if modal.trash_origin_y.is_none() {
                 let trash_source = match &modal.pending {

@@ -150,6 +150,7 @@ pub struct FsNode {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
+    pub content_type: trueos::content_identity::ContentTypeId,
     pub is_placeholder: bool,
     pub is_removed: bool,
     pub is_moved: bool,
@@ -327,6 +328,7 @@ impl GraphView {
             path: self.root.clone(),
             name: root_name,
             is_dir: true,
+            content_type: trueos::content_identity::ContentTypeId::NONE,
             is_placeholder: false,
             is_removed: false,
             is_moved: false,
@@ -418,13 +420,13 @@ impl GraphView {
         // This keeps an enormous directory from becoming an enormous allocation.
         let mut children = Vec::new();
         let mut directory_truncated = listing_truncated;
-        for (mut_is_folder, name, path, is_dir, is_symlink) in entries {
+        for (mut_is_folder, name, path, is_dir, is_symlink, content_type) in entries {
             if children.len() >= MAX_CHILDREN_PER_DIR {
                 directory_truncated = true;
                 break;
             }
 
-            children.push((mut_is_folder, name, path, is_dir, is_symlink));
+            children.push((mut_is_folder, name, path, is_dir, is_symlink, content_type));
         }
 
         children.sort_by(|a, b| (a.0, a.1.to_lowercase()).cmp(&(b.0, b.1.to_lowercase())));
@@ -434,7 +436,7 @@ impl GraphView {
         // global 256-node rendering budget.
         let mut recurse = Vec::new();
         let mut globally_truncated = false;
-        for (_, name, path, is_dir, is_symlink) in children {
+        for (_, name, path, is_dir, is_symlink, content_type) in children {
             if *remaining == 0 {
                 globally_truncated = true;
                 break;
@@ -447,6 +449,7 @@ impl GraphView {
                 path: path.clone(),
                 name,
                 is_dir,
+                content_type,
                 is_placeholder: false,
                 is_removed: false,
                 is_moved: false,
@@ -484,7 +487,17 @@ impl GraphView {
     fn read_dir_entries(
         &self,
         dir: &Path,
-    ) -> io::Result<(Vec<(bool, String, PathBuf, bool, bool)>, bool)> {
+    ) -> io::Result<(
+        Vec<(
+            bool,
+            String,
+            PathBuf,
+            bool,
+            bool,
+            trueos::content_identity::ContentTypeId,
+        )>,
+        bool,
+    )> {
         let mut entries = Vec::new();
         let path = dir.to_str().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8")
@@ -497,7 +510,14 @@ impl GraphView {
             }
             let is_dir = matches!(entry.kind, async_fs::NodeKind::Directory);
             let child_path = dir.join(entry.name.as_str());
-            entries.push((!is_dir, entry.name, child_path, is_dir, false));
+            entries.push((
+                !is_dir,
+                entry.name,
+                child_path,
+                is_dir,
+                false,
+                entry.content_type,
+            ));
         }
         Ok((entries, listing.truncated))
     }
@@ -518,6 +538,7 @@ impl GraphView {
             path: PathBuf::new(),
             name: "...".to_string(),
             is_dir: false,
+            content_type: trueos::content_identity::ContentTypeId::NONE,
             is_placeholder: true,
             is_removed: false,
             is_moved: false,
@@ -941,6 +962,62 @@ impl GraphView {
 
     pub fn node(&self, id: usize) -> Option<&FsNode> {
         self.nodes.get(id)
+    }
+
+    pub fn image_paths_for_selection(
+        &self,
+        selected: Option<usize>,
+        selected_files: &[usize],
+    ) -> io::Result<Vec<String>> {
+        let ids: Vec<usize> = if selected_files.is_empty() {
+            selected.into_iter().collect()
+        } else {
+            selected_files.to_vec()
+        };
+        if ids.is_empty() || ids.len() > 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "select 1..=32 images or one image folder",
+            ));
+        }
+
+        if ids.len() == 1 {
+            let node = self.node(ids[0]).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "selected item no longer exists")
+            })?;
+            if node.is_dir {
+                let path = path_to_utf8(&node.path)?;
+                let listing = async_fs::block_on(async_fs::list_dir_typed(path.as_bytes()))
+                    .map_err(|error| io::Error::other(format!("list_dir failed ({error})")))?;
+                let contains_image = listing.entries.iter().any(|entry| {
+                    entry.kind == async_fs::NodeKind::File
+                        && is_viewable_image_type(entry.content_type)
+                });
+                return if contains_image {
+                    Ok(vec![path.to_string()])
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "folder contains no inferred PNG/JPEG images",
+                    ))
+                };
+            }
+        }
+
+        ids.into_iter()
+            .map(|id| {
+                let node = self.node(id).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "selected file no longer exists")
+                })?;
+                if node.is_dir || !is_viewable_image_type(node.content_type) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "selection contains a non-image file",
+                    ));
+                }
+                path_to_utf8(&node.path).map(str::to_string)
+            })
+            .collect()
     }
 
     pub fn sha256_node(&self, id: usize) -> io::Result<Sha256Result> {
@@ -1920,6 +1997,14 @@ impl GraphView {
             }
         }
     }
+}
+
+fn is_viewable_image_type(content_type: trueos::content_identity::ContentTypeId) -> bool {
+    matches!(
+        content_type,
+        trueos::content_identity::ContentTypeId::JPEG
+            | trueos::content_identity::ContentTypeId::PNG
+    )
 }
 
 fn validate_name(name: &str) -> io::Result<()> {
