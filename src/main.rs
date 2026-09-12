@@ -102,6 +102,14 @@ impl Config {
             }
         }
 
+        // A scoped explorer starts at the primary filesystem root, not its
+        // per-app working directory. Explicit browse paths still take priority.
+        if initial_path.is_none()
+            && env::var("TRUEOS_FS_SCOPE").as_deref() == Ok("trueosfs")
+        {
+            initial_path = Some(PathBuf::from("/"));
+        }
+
         Self {
             diagnostics,
             initial_path,
@@ -293,9 +301,10 @@ mod launch_script_tests {
     }
 }
 
-fn available_mounts(_graph: &GraphView) -> Vec<MountLink> {
-    trueos::async_fs::block_on(trueos::async_fs::list_mounts())
-        .unwrap_or_default()
+fn available_mounts() -> io::Result<Vec<MountLink>> {
+    let mounts = trueos::async_fs::block_on(trueos::async_fs::list_mounts())
+        .map_err(|error| io::Error::other(format!("list_mounts failed ({error}); TRUEOSFS scope required")))?;
+    Ok(mounts
         .into_iter()
         .map(|mount| MountLink {
             path: PathBuf::from(mount.selector),
@@ -303,7 +312,7 @@ fn available_mounts(_graph: &GraphView) -> Vec<MountLink> {
             primary: mount.primary,
             read_only: mount.read_only,
         })
-        .collect()
+        .collect())
 }
 
 struct TerminalGuard {
@@ -456,11 +465,19 @@ impl App {
         if let Some(depth) = config.initial_depth {
             graph.set_depth_limit(depth)?;
         }
-        let mounts = available_mounts(&graph);
         let mut logs = VecDeque::new();
         logs.push_back(format!("⇝ {BUILD_ID}"));
         logs.push_back(format!("⇝ Mounted {}", graph.root_label()));
-        logs.push_back(format!("⇝ {} filesystem root mount(s)", mounts.len()));
+        let mounts = match available_mounts() {
+            Ok(mounts) => {
+                logs.push_back(format!("⇝ {} filesystem root mount(s)", mounts.len()));
+                mounts
+            }
+            Err(error) => {
+                logs.push_back(format!("MOUNT FAILED · {error}"));
+                Vec::new()
+            }
+        };
         logs.push_back("⇝ LMB select/drag · MMB/WASD/arrows pan · Home center".to_string());
         logs.push_back("⇝ Tab changes menu segment · 0..9 runs local segment item".to_string());
         logs.push_back("⇝ Esc hides TUI · tui reopens · Ctrl-Q exits app".to_string());
@@ -1515,9 +1532,10 @@ fn open_link(app: &mut App, index: usize) -> io::Result<()> {
 
 fn open_mount(app: &mut App, index: usize) -> io::Result<()> {
     let result: io::Result<String> = if index == 0 {
-        app.graph.reload().map(|()| {
-            app.mounts = available_mounts(&app.graph);
-            format!("MOUNT · refreshed {} root(s)", app.mounts.len())
+        available_mounts().and_then(|mounts| {
+            app.mounts = mounts;
+            app.graph.reload()?;
+            Ok(format!("MOUNT · refreshed {} root(s)", app.mounts.len()))
         })
     } else {
         let Some(mount) = app.mounts.get(index - 1).cloned() else {

@@ -29,9 +29,12 @@ Initial path
       browse /
       depth 2
 
-  `fs-scope trueosfs` is a host-side capability grant. Without it, the standard
-  v filesystem API keeps mapping paths to the app root plus `/common`, and
-  `browse /` means the app root. With it, termdir can enumerate every mounted
+  termdir declares `fs-scope = "trueosfs"` in its Blueprint package metadata,
+  so ordinary launches already receive this capability and default to `/`.
+  An explicit browse path overrides that default. The launch-script directive
+  above also grants the scope (including for older termdir packages).
+  Without either grant, the standard v filesystem API maps paths to the app
+  root plus `/common`. With the grant, termdir can enumerate every mounted
   TRUEOSFS root and shows those roots at the top of the Mount menu. `★` marks
   the primary root and `◇` marks a read-only root. Root selectors have the form
   `trueosfs:discN`.
