@@ -67,7 +67,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex
 }
 
-fn unique_archive_destination(preferred: &Path, keep_7z_extension: bool) -> io::Result<PathBuf> {
+fn unique_archive_destination(
+    preferred: &Path,
+    keep_archive_extension: bool,
+) -> io::Result<PathBuf> {
     if !trueos_exists(preferred)? {
         return Ok(preferred.to_path_buf());
     }
@@ -81,14 +84,23 @@ fn unique_archive_destination(preferred: &Path, keep_7z_extension: bool) -> io::
                 "archive output name is not UTF-8",
             )
         })?;
-    let base = if keep_7z_extension {
-        name.strip_suffix(".7z").unwrap_or(name)
+    let extension = if keep_archive_extension {
+        if name.to_ascii_lowercase().ends_with(".tar.lz4") {
+            ".tar.lz4"
+        } else {
+            ".7z"
+        }
     } else {
+        ""
+    };
+    let base = if extension.is_empty() {
         name
+    } else {
+        &name[..name.len() - extension.len()]
     };
     for suffix in 2..=999 {
-        let name = if keep_7z_extension {
-            format!("{base}-{suffix}.7z")
+        let name = if keep_archive_extension {
+            format!("{base}-{suffix}{extension}")
         } else {
             format!("{base}-{suffix}")
         };
@@ -269,6 +281,13 @@ struct EdgeCell {
     mask: u8,
 }
 
+struct PendingArchive {
+    future:
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<trueos::archive::Report, i32>>>>,
+    destination: String,
+    label: &'static str,
+}
+
 pub struct GraphView {
     root: PathBuf,
     nodes: Vec<FsNode>,
@@ -282,6 +301,7 @@ pub struct GraphView {
     suppressed_parent_edges: Vec<bool>,
     depth_limit: usize,
     scene_revision: u64,
+    pending_archive: Option<PendingArchive>,
 }
 
 impl GraphView {
@@ -304,6 +324,7 @@ impl GraphView {
             suppressed_parent_edges: Vec::new(),
             depth_limit: DEFAULT_DEPTH_LIMIT,
             scene_revision: 0,
+            pending_archive: None,
         };
         view.reload()?;
         Ok(view)
@@ -1040,6 +1061,9 @@ impl GraphView {
     }
 
     pub fn archive_node(&mut self, id: usize) -> io::Result<String> {
+        if self.pending_archive.is_some() {
+            return Ok("ARCHIVE · an operation is already running".into());
+        }
         let node = self.node(id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "selected item no longer exists")
         })?;
@@ -1051,14 +1075,20 @@ impl GraphView {
         }
 
         let source = node.path.clone();
-        let extracting = source
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("7z"));
-        let preferred = if extracting {
-            source.with_extension("")
+        let source_text = path_to_utf8(&source)?;
+        let lower = source_text.to_ascii_lowercase();
+        let suffix = if lower.ends_with(".tar.lz4") {
+            Some(".tar.lz4")
+        } else if lower.ends_with(".7z") {
+            Some(".7z")
         } else {
-            PathBuf::from(format!("{}.7z", source.display()))
+            None
+        };
+        let extracting = suffix.is_some();
+        let label = if suffix == Some(".7z") { "7Z" } else { "LZ4" };
+        let preferred = match suffix {
+            Some(suffix) => PathBuf::from(&source_text[..source_text.len() - suffix.len()]),
+            None => PathBuf::from(format!("{}.tar.lz4", source.display())),
         };
         if preferred.as_os_str().is_empty() {
             return Err(io::Error::new(
@@ -1068,31 +1098,50 @@ impl GraphView {
         }
         let destination = unique_archive_destination(&preferred, !extracting)?;
 
-        let report = {
-            let source = path_to_utf8(&source)?;
-            let destination = path_to_utf8(&destination)?;
-            if extracting {
-                async_fs::block_on(trueos::archive::unpack(
-                    source.as_bytes(),
-                    destination.as_bytes(),
-                ))
-            } else {
-                async_fs::block_on(trueos::archive::pack(
-                    source.as_bytes(),
-                    destination.as_bytes(),
-                ))
-            }
-            .map_err(|error| trueos_fs_err("archive", error))?
-        };
+        let source = path_to_utf8(&source)?.to_owned();
+        let destination = path_to_utf8(&destination)?.to_owned();
+        let target = destination.clone();
+        self.pending_archive = Some(PendingArchive {
+            future: Box::pin(async move {
+                if extracting {
+                    trueos::archive::unpack(source.as_bytes(), target.as_bytes()).await
+                } else {
+                    trueos::archive::pack(source.as_bytes(), target.as_bytes()).await
+                }
+            }),
+            destination: destination.clone(),
+            label,
+        });
+        Ok(format!("{label} · running · {destination}"))
+    }
 
-        self.reload()?;
-        Ok(format!(
-            "7Z · {} · {} file(s) · {} → {} bytes",
-            destination.display(),
-            report.file_count,
-            report.input_bytes,
-            report.output_bytes
-        ))
+    /// Poll once per UI frame. The kernel owns the actual I/O and codec work;
+    /// this future only starts the request and observes its operation handle.
+    pub fn poll_archive(&mut self) -> Option<String> {
+        let pending = self.pending_archive.as_mut()?;
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let result = match pending.future.as_mut().poll(&mut context) {
+            std::task::Poll::Pending => return None,
+            std::task::Poll::Ready(result) => result,
+        };
+        let pending = self.pending_archive.take().unwrap();
+        Some(match result {
+            Ok(report) => {
+                let status = format!(
+                    "{} · {} · {} file(s) · {} → {} bytes",
+                    pending.label,
+                    pending.destination,
+                    report.file_count,
+                    report.input_bytes,
+                    report.output_bytes
+                );
+                match self.reload() {
+                    Ok(()) => status,
+                    Err(error) => format!("{status} · refresh failed: {error}"),
+                }
+            }
+            Err(error) => format!("ARCHIVE FAILED · {}", trueos_fs_err("archive", error)),
+        })
     }
 
     /// Bundle explicit regular files from one directory. A multi-file archive
@@ -1100,6 +1149,9 @@ impl GraphView {
     /// the explorer only creates this selection inside one parent directory,
     /// so every entry name is unique and extraction restores those siblings.
     pub fn archive_nodes(&mut self, sources: &[usize]) -> io::Result<String> {
+        if self.pending_archive.is_some() {
+            return Ok("ARCHIVE · an operation is already running".into());
+        }
         if sources.len() == 1 {
             return self.archive_node(sources[0]);
         }
@@ -1107,24 +1159,22 @@ impl GraphView {
         let parent = nodes[0].path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "selected file has no parent")
         })?;
-        let destination = unique_archive_destination(&parent.join("bundle.7z"), true)?;
-        let source_paths: Vec<&str> = nodes
+        let destination = unique_archive_destination(&parent.join("bundle.tar.lz4"), true)?;
+        let source_paths: Vec<String> = nodes
             .iter()
-            .map(|node| path_to_utf8(&node.path))
+            .map(|node| path_to_utf8(&node.path).map(str::to_owned))
             .collect::<io::Result<_>>()?;
-        let source_bytes: Vec<&[u8]> = source_paths.iter().map(|path| path.as_bytes()).collect();
-        let destination = path_to_utf8(&destination)?;
-        let report = async_fs::block_on(trueos::archive::pack_many(
-            source_bytes.as_slice(),
-            destination.as_bytes(),
-        ))
-        .map_err(|error| trueos_fs_err("archive", error))?;
-
-        self.reload()?;
-        Ok(format!(
-            "7Z · {} · {} file(s) · {} → {} bytes",
-            destination, report.file_count, report.input_bytes, report.output_bytes
-        ))
+        let destination = path_to_utf8(&destination)?.to_owned();
+        let target = destination.clone();
+        self.pending_archive = Some(PendingArchive {
+            future: Box::pin(async move {
+                let paths: Vec<_> = source_paths.iter().map(|path| path.as_bytes()).collect();
+                trueos::archive::pack_many(&paths, target.as_bytes()).await
+            }),
+            destination: destination.clone(),
+            label: "LZ4",
+        });
+        Ok(format!("LZ4 · running · {destination}"))
     }
 
     pub fn label(&self, id: usize) -> String {
@@ -2323,6 +2373,54 @@ fn relative_age(when: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::sha256_hex;
+
+    #[test]
+    fn archive_operation_polls_once_and_rejects_duplicate_start() {
+        use super::*;
+        use std::{cell::Cell, rc::Rc, task::Poll};
+        let polls = Rc::new(Cell::new(0));
+        let counter = polls.clone();
+        let mut graph = GraphView {
+            root: PathBuf::new(),
+            nodes: Vec::new(),
+            positions: Vec::new(),
+            edge_cells: Vec::new(),
+            camera_x: 0,
+            camera_y: 0,
+            column_gap: 18,
+            layout_mode: LayoutMode::Tree,
+            line_style: LineStyle::Default,
+            suppressed_parent_edges: Vec::new(),
+            depth_limit: DEFAULT_DEPTH_LIMIT,
+            scene_revision: 0,
+            pending_archive: Some(PendingArchive {
+                future: Box::pin(std::future::poll_fn(move |_| {
+                    counter.set(counter.get() + 1);
+                    if counter.get() == 1 {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Err(-2))
+                    }
+                })),
+                destination: "test.tar.lz4".into(),
+                label: "LZ4",
+            }),
+        };
+        assert!(graph.poll_archive().is_none());
+        assert_eq!(polls.get(), 1);
+        assert!(graph.archive_node(0).unwrap().contains("already running"));
+        assert!(
+            graph
+                .archive_nodes(&[])
+                .unwrap()
+                .contains("already running")
+        );
+        assert_eq!(polls.get(), 1);
+        assert!(graph.poll_archive().unwrap().starts_with("ARCHIVE FAILED"));
+        assert_eq!(polls.get(), 2);
+        assert!(graph.pending_archive.is_none());
+        assert!(graph.poll_archive().is_none());
+    }
 
     #[test]
     fn sha256_matches_known_vector() {

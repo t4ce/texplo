@@ -143,7 +143,7 @@ pub const MENU_ENTRIES: [MenuEntry; 15] = [
         section: MenuSection::Action,
     },
     MenuEntry {
-        label: "7z 🗜",
+        label: "LZ4 🗜",
         command: MenuCommand::Zip,
         section: MenuSection::Action,
     },
@@ -897,16 +897,16 @@ pub fn dispatch_menu_selected(
         MenuCommand::Zip => match selected {
             Some(source) => Ok(Dispatch::Status(match graph.archive_node(source) {
                 Ok(status) => status,
-                Err(err) => format!("7Z FAILED · {err}"),
+                Err(err) => format!("ARCHIVE FAILED · {err}"),
             })),
             None if !selected_files.is_empty() => Ok(Dispatch::Status(
                 match graph.archive_nodes(selected_files) {
                     Ok(status) => status,
-                    Err(err) => format!("7Z FAILED · {err}"),
+                    Err(err) => format!("ARCHIVE FAILED · {err}"),
                 },
             )),
             None => Ok(Dispatch::Status(
-                "7Z · select one file or folder first".to_string(),
+                "ARCHIVE · select one file or folder first".to_string(),
             )),
         },
         MenuCommand::Rename => match selected {

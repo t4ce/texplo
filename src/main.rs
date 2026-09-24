@@ -104,9 +104,7 @@ impl Config {
 
         // A scoped explorer starts at the primary filesystem root, not its
         // per-app working directory. Explicit browse paths still take priority.
-        if initial_path.is_none()
-            && env::var("TRUEOS_FS_SCOPE").as_deref() == Ok("trueosfs")
-        {
+        if initial_path.is_none() && env::var("TRUEOS_FS_SCOPE").as_deref() == Ok("trueosfs") {
             initial_path = Some(PathBuf::from("/"));
         }
 
@@ -302,8 +300,11 @@ mod launch_script_tests {
 }
 
 fn available_mounts() -> io::Result<Vec<MountLink>> {
-    let mounts = trueos::async_fs::block_on(trueos::async_fs::list_mounts())
-        .map_err(|error| io::Error::other(format!("list_mounts failed ({error}); TRUEOSFS scope required")))?;
+    let mounts = trueos::async_fs::block_on(trueos::async_fs::list_mounts()).map_err(|error| {
+        io::Error::other(format!(
+            "list_mounts failed ({error}); TRUEOSFS scope required"
+        ))
+    })?;
     Ok(mounts
         .into_iter()
         .map(|mount| MountLink {
@@ -721,6 +722,11 @@ fn run_terminal_session(
             let now = Instant::now();
             app.update_resize(now);
             update_animation(app, now);
+            if let Some(status) = app.graph.poll_archive() {
+                app.set_selected(None);
+                app.clear_transient();
+                app.log(status);
+            }
 
             if app.dirty && app.resize_deadline.is_none() {
                 let frame = compose_frame(app)?;
