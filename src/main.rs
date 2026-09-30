@@ -1583,7 +1583,7 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
             Ok(()) => app.log(format!("SHOW · opening {} image source(s)", paths.len())),
             Err(error) => app.log(format!("SHOW FAILED · host request code={error}")),
         },
-        Dispatch::Play(path) => match trueos::vshell::play_video(&path) {
+        Dispatch::Play(path) => match trueos::vshell::play_video_qualified(&path) {
             Ok(()) => app.log("PLY · opening looping video"),
             Err(error) => app.log(format!("PLY FAILED · host request code={error}")),
         },

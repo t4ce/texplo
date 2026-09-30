@@ -991,7 +991,18 @@ impl GraphView {
             || node.content_type != trueos::content_identity::ContentTypeId::MP4 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "select one inferred MP4 file"));
         }
-        path_to_utf8(&node.path).map(str::to_string)
+        let path = path_to_utf8(&node.path)?;
+        if path.starts_with("trueosfs:disc") {
+            return Ok(path.to_string());
+        }
+        if !path.starts_with('/') {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "video path is outside TRUEOSFS"));
+        }
+        let mounts = async_fs::block_on(async_fs::list_mounts())
+            .map_err(|err| trueos_fs_err("list_mounts", err))?;
+        let primary = mounts.iter().find(|mount| mount.primary)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "primary TRUEOSFS disc unavailable"))?;
+        Ok(format!("{}{}", primary.selector, path))
     }
 
     pub fn image_paths_for_selection(
