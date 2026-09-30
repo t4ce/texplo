@@ -985,6 +985,15 @@ impl GraphView {
         self.nodes.get(id)
     }
 
+    pub fn video_path_for_node(&self, id: usize) -> io::Result<String> {
+        let node = self.node(id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "selected file no longer exists"))?;
+        if node.is_dir || node.is_placeholder || node.is_removed || node.is_moved || node.hidden
+            || node.content_type != trueos::content_identity::ContentTypeId::MP4 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "select one inferred MP4 file"));
+        }
+        path_to_utf8(&node.path).map(str::to_string)
+    }
+
     pub fn image_paths_for_selection(
         &self,
         selected: Option<usize>,

@@ -617,6 +617,7 @@ impl App {
             Some(node) if node.is_dir && !self.show_paths.is_empty() => MenuContext::ImageFolder,
             Some(node) if node.is_dir => MenuContext::Folder,
             Some(_) if !self.show_paths.is_empty() => MenuContext::ImageFile,
+            Some(node) if node.content_type == trueos::content_identity::ContentTypeId::MP4 => MenuContext::VideoFile,
             Some(_) => MenuContext::File,
             None => MenuContext::None,
         }
@@ -1581,6 +1582,10 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
         Dispatch::Show(paths) => match trueos::vshell::open_images(paths.as_slice()) {
             Ok(()) => app.log(format!("SHOW · opening {} image source(s)", paths.len())),
             Err(error) => app.log(format!("SHOW FAILED · host request code={error}")),
+        },
+        Dispatch::Play(path) => match trueos::vshell::play_video(&path) {
+            Ok(()) => app.log("PLY · opening looping video"),
+            Err(error) => app.log(format!("PLY FAILED · host request code={error}")),
         },
         Dispatch::Modal(mut modal) => {
             if modal.trash_origin_y.is_none() {

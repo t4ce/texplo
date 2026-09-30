@@ -22,6 +22,7 @@ pub enum MenuCommand {
     Center,
     Enter,
     Show,
+    Play,
     Sha256,
     Zip,
     Rename,
@@ -36,6 +37,7 @@ pub enum MenuContext {
     None,
     File,
     ImageFile,
+    VideoFile,
     Files,
     ImageFiles,
     Folder,
@@ -76,7 +78,7 @@ pub struct MenuEntry {
 
 // The visual order is the contract from ☰enu_Rework.txt. Local hotkeys are
 // assigned after contextual filtering, so every section reuses 🯰..🯹/0..9.
-pub const MENU_ENTRIES: [MenuEntry; 15] = [
+pub const MENU_ENTRIES: [MenuEntry; 16] = [
     MenuEntry {
         label: "center",
         command: MenuCommand::Center,
@@ -115,6 +117,11 @@ pub const MENU_ENTRIES: [MenuEntry; 15] = [
     MenuEntry {
         label: "show",
         command: MenuCommand::Show,
+        section: MenuSection::Action,
+    },
+    MenuEntry {
+        label: "ply",
+        command: MenuCommand::Play,
         section: MenuSection::Action,
     },
     MenuEntry {
@@ -373,13 +380,14 @@ impl MenuState {
             | MenuCommand::Exit => true,
             // A digest describes one byte stream. Multi-file selection leaves
             // it unavailable rather than implying a made-up combined hash.
-            MenuCommand::Sha256 => matches!(context, MenuContext::File | MenuContext::ImageFile),
+            MenuCommand::Sha256 => matches!(context, MenuContext::File | MenuContext::ImageFile | MenuContext::VideoFile),
             MenuCommand::Zip => context != MenuContext::None,
             MenuCommand::Enter => matches!(context, MenuContext::Folder | MenuContext::ImageFolder),
             MenuCommand::Show => matches!(
                 context,
                 MenuContext::ImageFile | MenuContext::ImageFiles | MenuContext::ImageFolder
             ),
+            MenuCommand::Play => context == MenuContext::VideoFile,
             MenuCommand::NewFolder | MenuCommand::NewFile => {
                 matches!(
                     context,
@@ -391,6 +399,7 @@ impl MenuState {
                     context,
                     MenuContext::File
                         | MenuContext::ImageFile
+                        | MenuContext::VideoFile
                         | MenuContext::Files
                         | MenuContext::ImageFiles
                         | MenuContext::Folder
@@ -401,6 +410,7 @@ impl MenuState {
                 context,
                 MenuContext::File
                     | MenuContext::ImageFile
+                    | MenuContext::VideoFile
                     | MenuContext::Folder
                     | MenuContext::ImageFolder
             ),
@@ -800,6 +810,7 @@ pub enum Dispatch {
     Exit,
     Zoom,
     Show(Vec<String>),
+    Play(String),
     Modal(Modal),
     Sha256(Sha256Result),
     Status(String),
@@ -884,6 +895,10 @@ pub fn dispatch_menu_selected(
         MenuCommand::Show => match graph.image_paths_for_selection(selected, selected_files) {
             Ok(paths) => Ok(Dispatch::Show(paths)),
             Err(error) => Ok(Dispatch::Status(format!("SHOW FAILED · {error}"))),
+        },
+        MenuCommand::Play => match selected.and_then(|id| graph.video_path_for_node(id).ok()) {
+            Some(path) => Ok(Dispatch::Play(path)),
+            None => Ok(Dispatch::Status("PLY FAILED · select one inferred MP4 file".to_string())),
         },
         MenuCommand::Sha256 => match selected {
             Some(source) => match graph.sha256_node(source) {
@@ -1296,6 +1311,17 @@ mod tests {
         ] {
             assert!(!MenuState::is_visible(show, context));
         }
+    }
+
+    #[test]
+    fn play_is_only_visible_for_one_inferred_mp4() {
+        let play = MenuState::index_for_command(MenuCommand::Play).unwrap();
+        for context in [MenuContext::None, MenuContext::File, MenuContext::Files,
+            MenuContext::ImageFile, MenuContext::ImageFiles, MenuContext::Folder,
+            MenuContext::ImageFolder] {
+            assert!(!MenuState::is_visible(play, context));
+        }
+        assert!(MenuState::is_visible(play, MenuContext::VideoFile));
     }
 
     #[test]
