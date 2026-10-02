@@ -988,8 +988,8 @@ impl GraphView {
     pub fn video_path_for_node(&self, id: usize) -> io::Result<String> {
         let node = self.node(id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "selected file no longer exists"))?;
         if node.is_dir || node.is_placeholder || node.is_removed || node.is_moved || node.hidden
-            || node.content_type != trueos::content_identity::ContentTypeId::MP4 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "select one inferred MP4 file"));
+            || !is_playable_video_type(node.content_type) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "select one inferred MP4 or MKV file"));
         }
         let path = path_to_utf8(&node.path)?;
         if path.starts_with("trueosfs:disc") {
@@ -2069,6 +2069,12 @@ impl GraphView {
     }
 }
 
+pub fn is_playable_video_type(content_type: trueos::content_identity::ContentTypeId) -> bool {
+    matches!(content_type,
+        trueos::content_identity::ContentTypeId::MP4
+            | trueos::content_identity::ContentTypeId::MATROSKA)
+}
+
 fn is_viewable_image_type(content_type: trueos::content_identity::ContentTypeId) -> bool {
     matches!(
         content_type,
@@ -2440,6 +2446,38 @@ mod tests {
         assert_eq!(polls.get(), 2);
         assert!(graph.pending_archive.is_none());
         assert!(graph.poll_archive().is_none());
+    }
+
+    #[test]
+    fn video_dispatch_uses_inferred_identity_and_preserves_disc_selector() {
+        use super::*;
+        use trueos::content_identity::ContentTypeId;
+        let mut graph = GraphView {
+            root: PathBuf::new(),
+            nodes: vec![FsNode {
+                id: 0, parent: None,
+                path: PathBuf::from("trueosfs:disc7/movie.bin"),
+                name: "movie.bin".into(), is_dir: false,
+                content_type: ContentTypeId::MATROSKA,
+                is_placeholder: false, is_removed: false, is_moved: false,
+                hidden: false, depth: 0,
+            }],
+            positions: Vec::new(), edge_cells: Vec::new(),
+            camera_x: 0, camera_y: 0, column_gap: 18,
+            layout_mode: LayoutMode::Tree, line_style: LineStyle::Default,
+            suppressed_parent_edges: Vec::new(), depth_limit: DEFAULT_DEPTH_LIMIT,
+            scene_revision: 0, pending_archive: None,
+        };
+        for content_type in [ContentTypeId::MATROSKA, ContentTypeId::MP4] {
+            graph.nodes[0].content_type = content_type;
+            assert_eq!(graph.video_path_for_node(0).unwrap(), "trueosfs:disc7/movie.bin");
+        }
+        graph.nodes[0].path = PathBuf::from("trueosfs:disc7/movie.mkv");
+        graph.nodes[0].content_type = ContentTypeId::BLOB;
+        assert!(graph.video_path_for_node(0).is_err());
+        graph.nodes[0].content_type = ContentTypeId::MATROSKA;
+        graph.nodes[0].is_removed = true;
+        assert!(graph.video_path_for_node(0).is_err());
     }
 
     #[test]

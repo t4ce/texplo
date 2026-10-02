@@ -617,7 +617,7 @@ impl App {
             Some(node) if node.is_dir && !self.show_paths.is_empty() => MenuContext::ImageFolder,
             Some(node) if node.is_dir => MenuContext::Folder,
             Some(_) if !self.show_paths.is_empty() => MenuContext::ImageFile,
-            Some(node) if node.content_type == trueos::content_identity::ContentTypeId::MP4 => MenuContext::VideoFile,
+            Some(node) if graph_view::is_playable_video_type(node.content_type) => MenuContext::VideoFile,
             Some(_) => MenuContext::File,
             None => MenuContext::None,
         }

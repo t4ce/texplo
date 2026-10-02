@@ -898,7 +898,7 @@ pub fn dispatch_menu_selected(
         },
         MenuCommand::Play => match selected.and_then(|id| graph.video_path_for_node(id).ok()) {
             Some(path) => Ok(Dispatch::Play(path)),
-            None => Ok(Dispatch::Status("PLY FAILED · select one inferred MP4 file".to_string())),
+            None => Ok(Dispatch::Status("PLY FAILED · select one inferred MP4 or MKV file".to_string())),
         },
         MenuCommand::Sha256 => match selected {
             Some(source) => match graph.sha256_node(source) {
@@ -1314,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn play_is_only_visible_for_one_inferred_mp4() {
+    fn play_is_only_visible_for_one_video_file() {
         let play = MenuState::index_for_command(MenuCommand::Play).unwrap();
         for context in [MenuContext::None, MenuContext::File, MenuContext::Files,
             MenuContext::ImageFile, MenuContext::ImageFiles, MenuContext::Folder,
