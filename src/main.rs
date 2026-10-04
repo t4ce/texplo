@@ -740,10 +740,14 @@ fn run_terminal_session(
             let now = Instant::now();
             app.update_resize(now);
             update_animation(app, now);
-            if let Some(status) = app.graph.poll_archive() {
+            let archive_scene = app.graph.scene_revision();
+            if let Some(status) = app.graph.poll_archive(now) {
                 app.set_selected(None);
                 app.clear_transient();
                 app.log(status);
+            }
+            if app.graph.scene_revision() != archive_scene {
+                app.mark_dirty();
             }
 
             if app.dirty && app.resize_deadline.is_none() {

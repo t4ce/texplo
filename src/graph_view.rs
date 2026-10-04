@@ -34,6 +34,9 @@ fn path_to_utf8(path: &Path) -> io::Result<&str> {
 }
 
 fn trueos_fs_err(op: &str, err: i32) -> io::Error {
+    if op == "archive" && err == trueos::archive::ERR_TOO_LARGE {
+        return io::Error::other("archive exceeds a size, entry, or path resource limit (-7)");
+    }
     io::Error::other(format!("{op} failed ({err})"))
 }
 
@@ -290,6 +293,15 @@ struct PendingArchive {
     destination: String,
     label: &'static str,
     last_marker: std::time::Instant,
+    source: Option<PathBuf>,
+    progress: std::rc::Rc<std::cell::Cell<u32>>,
+    started: std::time::Instant,
+    next_poll: std::time::Instant,
+    displayed_percent: Option<u32>,
+}
+
+fn unpack_label_percent(elapsed: std::time::Duration, percent: u32) -> Option<u32> {
+    (elapsed.as_millis() % 4000 < 3000).then_some(percent.min(99))
 }
 
 pub struct GraphView {
@@ -305,7 +317,7 @@ pub struct GraphView {
     suppressed_parent_edges: Vec<bool>,
     depth_limit: usize,
     scene_revision: u64,
-    pending_archive: Option<PendingArchive>,
+    pending_archives: Vec<PendingArchive>,
 }
 
 impl GraphView {
@@ -328,7 +340,7 @@ impl GraphView {
             suppressed_parent_edges: Vec::new(),
             depth_limit: DEFAULT_DEPTH_LIMIT,
             scene_revision: 0,
-            pending_archive: None,
+            pending_archives: Vec::new(),
         };
         view.reload()?;
         Ok(view)
@@ -1123,8 +1135,9 @@ impl GraphView {
     }
 
     fn archive_node_with_folder(&mut self, id: usize, folder: Option<&str>) -> io::Result<String> {
-        crate::archive_log(format_args!("termdir/archive: phase=prepare node={id} folder={folder:?} busy={}", self.pending_archive.is_some()));
-        if self.pending_archive.is_some() {
+        crate::archive_log(format_args!("termdir/archive: phase=prepare node={id} folder={folder:?} busy={}", !self.pending_archives.is_empty()));
+        let is_unpack = self.archive_default_folder(id).is_some();
+        if !self.pending_archives.is_empty() && !is_unpack {
             return Ok("ARCHIVE · an operation is already running".into());
         }
         let node = self.node(id).ok_or_else(|| {
@@ -1138,6 +1151,9 @@ impl GraphView {
         }
 
         let source = node.path.clone();
+        if self.pending_archives.iter().any(|job| job.source.as_ref() == Some(&source)) {
+            return Ok("ARCHIVE · this archive is already unpacking".into());
+        }
         crate::archive_log(format_args!("termdir/archive: phase=source path={:?} directory={}", source, node.is_dir));
         let source_text = path_to_utf8(&source)?;
         let suffix = if node.is_dir {
@@ -1173,15 +1189,25 @@ impl GraphView {
             unique_archive_destination(&preferred, !extracting)?
         };
 
+        let unpack_source = extracting.then(|| source.clone());
         let source = path_to_utf8(&source)?.to_owned();
         let destination = path_to_utf8(&destination)?.to_owned();
+        if self.pending_archives.iter().any(|job| {
+            let active = Path::new(&job.destination);
+            let requested = Path::new(&destination);
+            active.starts_with(requested) || requested.starts_with(active)
+        }) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination is already being written by an archive operation"));
+        }
+        let progress = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_progress = progress.clone();
         let target = destination.clone();
         crate::archive_log(format_args!("termdir/archive: phase=future-created extracting={extracting} source={source:?} destination={destination:?}"));
-        self.pending_archive = Some(PendingArchive {
+        self.pending_archives.push(PendingArchive {
             future: Box::pin(async move {
                 crate::archive_log(format_args!("termdir/archive: phase=api-call extracting={extracting} source={source:?} destination={target:?}"));
                 if extracting {
-                    trueos::archive::unpack(source.as_bytes(), target.as_bytes()).await
+                    trueos::archive::unpack_with_progress(source.as_bytes(), target.as_bytes(), move |percent| observed_progress.set(percent)).await
                 } else {
                     trueos::archive::pack(source.as_bytes(), target.as_bytes()).await
                 }
@@ -1189,42 +1215,54 @@ impl GraphView {
             destination: destination.clone(),
             label,
             last_marker: std::time::Instant::now(),
+            source: unpack_source,
+            progress,
+            started: std::time::Instant::now(),
+            next_poll: std::time::Instant::now(),
+            displayed_percent: Some(0),
         });
+        self.bump_scene_revision();
         Ok(format!("{label} · running · {destination}"))
     }
 
-    /// Poll once per UI frame. The kernel owns the actual I/O and codec work;
-    /// this future only starts the request and observes its operation handle.
-    pub fn poll_archive(&mut self) -> Option<String> {
-        let pending = self.pending_archive.as_mut()?;
-        if pending.last_marker.elapsed() >= std::time::Duration::from_secs(5) {
-            crate::archive_log(format_args!("termdir/archive: phase=ui-wait destination={:?}", pending.destination));
-            pending.last_marker = std::time::Instant::now();
-        }
+    /// Observe all jobs on the same cadence as the falling drop animation.
+    pub fn poll_archive(&mut self, now: std::time::Instant) -> Option<String> {
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        let result = match pending.future.as_mut().poll(&mut context) {
-            std::task::Poll::Pending => return None,
-            std::task::Poll::Ready(result) => result,
-        };
-        let pending = self.pending_archive.take().unwrap();
-        crate::archive_log(format_args!("termdir/archive: phase=api-return destination={:?} result={result:?}", pending.destination));
-        Some(match result {
-            Ok(report) => {
-                let status = format!(
-                    "{} · {} · {} file(s) · {} → {} bytes",
-                    pending.label,
-                    pending.destination,
-                    report.file_count,
-                    report.input_bytes,
-                    report.output_bytes
-                );
-                match self.reload() {
-                    Ok(()) => status,
-                    Err(error) => format!("{status} · refresh failed: {error}"),
-                }
+        let mut completed = Vec::new();
+        let mut changed = false;
+        let mut refresh = false;
+        self.pending_archives.retain_mut(|pending| {
+            if now < pending.next_poll { return true; }
+            pending.next_poll = now + crate::FALL_TICK;
+            if now.duration_since(pending.last_marker) >= std::time::Duration::from_secs(5) {
+                crate::archive_log(format_args!("termdir/archive: phase=ui-wait destination={:?}", pending.destination));
+                pending.last_marker = now;
             }
-            Err(error) => format!("ARCHIVE FAILED · {}", trueos_fs_err("archive", error)),
-        })
+            let result = pending.future.as_mut().poll(&mut context);
+            let percent = pending.source.as_ref().and_then(|_| unpack_label_percent(
+                now.saturating_duration_since(pending.started), pending.progress.get()));
+            changed |= percent != pending.displayed_percent;
+            pending.displayed_percent = percent;
+            let std::task::Poll::Ready(result) = result else { return true; };
+            changed = true;
+            crate::archive_log(format_args!("termdir/archive: phase=api-return destination={:?} result={result:?}", pending.destination));
+            completed.push(match result {
+                Ok(report) => {
+                    refresh = true;
+                    format!("{} · {} · {} file(s) · {} → {} bytes", pending.label,
+                        pending.destination, report.file_count, report.input_bytes, report.output_bytes)
+                }
+                Err(error) => format!("ARCHIVE FAILED · {}", trueos_fs_err("archive", error)),
+            });
+            false
+        });
+        if changed { self.bump_scene_revision(); }
+        if refresh {
+            if let Err(error) = self.reload() {
+                completed.push(format!("refresh failed: {error}"));
+            }
+        }
+        (!completed.is_empty()).then(|| completed.join(" · "))
     }
 
     /// Bundle explicit regular files from one directory. A multi-file archive
@@ -1232,7 +1270,7 @@ impl GraphView {
     /// the explorer only creates this selection inside one parent directory,
     /// so every entry name is unique and extraction restores those siblings.
     pub fn archive_nodes(&mut self, sources: &[usize]) -> io::Result<String> {
-        if self.pending_archive.is_some() {
+        if !self.pending_archives.is_empty() {
             return Ok("ARCHIVE · an operation is already running".into());
         }
         if sources.len() == 1 {
@@ -1249,7 +1287,7 @@ impl GraphView {
             .collect::<io::Result<_>>()?;
         let destination = path_to_utf8(&destination)?.to_owned();
         let target = destination.clone();
-        self.pending_archive = Some(PendingArchive {
+        self.pending_archives.push(PendingArchive {
             future: Box::pin(async move {
                 crate::archive_log(format_args!("termdir/archive: phase=api-call pack-many sources={source_paths:?} destination={target:?}"));
                 let paths: Vec<_> = source_paths.iter().map(|path| path.as_bytes()).collect();
@@ -1258,6 +1296,11 @@ impl GraphView {
             destination: destination.clone(),
             label: "LZ4",
             last_marker: std::time::Instant::now(),
+            source: None,
+            progress: std::rc::Rc::new(std::cell::Cell::new(0)),
+            started: std::time::Instant::now(),
+            next_poll: std::time::Instant::now(),
+            displayed_percent: None,
         });
         Ok(format!("LZ4 · running · {destination}"))
     }
@@ -1289,7 +1332,13 @@ impl GraphView {
                     "...".to_string()
                 } else {
                     let icon = if n.is_dir { "🖿" } else { "🖹" };
-                    format!("{icon} {}", n.name)
+                    let progress = self.pending_archives.iter()
+                        .find(|job| job.source.as_ref() == Some(&n.path))
+                        .and_then(|job| job.displayed_percent);
+                    match progress {
+                        Some(percent) => format!("{icon} {percent}%"),
+                        None => format!("{icon} {}", n.name),
+                    }
                 }
             })
             .unwrap_or_else(|| "?".to_string())
@@ -2500,21 +2549,26 @@ mod tests {
             suppressed_parent_edges: Vec::new(),
             depth_limit: DEFAULT_DEPTH_LIMIT,
             scene_revision: 0,
-            pending_archive: Some(PendingArchive {
+            pending_archives: vec![PendingArchive {
                 future: Box::pin(std::future::poll_fn(move |_| {
                     counter.set(counter.get() + 1);
                     if counter.get() == 1 {
                         Poll::Pending
                     } else {
-                        Poll::Ready(Err(-2))
+                        Poll::Ready(Err(trueos::archive::ERR_TOO_LARGE))
                     }
                 })),
                 destination: "test.tar.lz4".into(),
                 label: "LZ4",
                 last_marker: std::time::Instant::now(),
-            }),
+                source: None,
+                progress: std::rc::Rc::new(std::cell::Cell::new(0)),
+                started: std::time::Instant::now(),
+                next_poll: std::time::Instant::now(),
+                displayed_percent: None,
+            }],
         };
-        assert!(graph.poll_archive().is_none());
+        assert!(graph.poll_archive(std::time::Instant::now() + crate::FALL_TICK).is_none());
         assert_eq!(polls.get(), 1);
         assert!(graph.archive_node(0).unwrap().contains("already running"));
         assert!(
@@ -2524,10 +2578,63 @@ mod tests {
                 .contains("already running")
         );
         assert_eq!(polls.get(), 1);
-        assert!(graph.poll_archive().unwrap().starts_with("ARCHIVE FAILED"));
+        let message = graph.poll_archive(std::time::Instant::now() + crate::FALL_TICK * 2).unwrap();
+        assert!(message.starts_with("ARCHIVE FAILED"));
+        assert!(message.contains("resource limit (-7)"));
         assert_eq!(polls.get(), 2);
-        assert!(graph.pending_archive.is_none());
-        assert!(graph.poll_archive().is_none());
+        assert!(graph.pending_archives.is_empty());
+        assert!(graph.poll_archive(std::time::Instant::now() + crate::FALL_TICK).is_none());
+
+        // Two jobs remain independent, and only the polled cadence changes labels.
+        let started = std::time::Instant::now();
+        let done = Rc::new(Cell::new(false));
+        for (id, percent) in [(0, 42), (1, 67)] {
+            let path = PathBuf::from(format!("assets-{id}.tar.lz4"));
+            graph.nodes.push(FsNode {
+                id, parent: None, path: path.clone(), name: format!("assets-{id}.tar.lz4"),
+                is_dir: false, content_type: trueos::content_identity::ContentTypeId::LZ4,
+                is_placeholder: false, is_removed: false, is_moved: false, hidden: false, depth: 0,
+            });
+            let finished = done.clone();
+            graph.pending_archives.push(PendingArchive {
+                future: Box::pin(std::future::poll_fn(move |_| {
+                    if id == 0 && finished.get() { Poll::Ready(Err(-2)) } else { Poll::Pending }
+                })),
+                destination: format!("assets-{id}"), label: "UNPACK", last_marker: started,
+                source: Some(path), progress: Rc::new(Cell::new(percent)), started,
+                next_poll: started, displayed_percent: Some(0),
+            });
+        }
+        graph.poll_archive(started);
+        assert_eq!(graph.visual_label(0), "🖹 42%");
+        assert_eq!(graph.visual_label(1), "🖹 67%");
+        assert!(graph.archive_node(0).unwrap().contains("already unpacking"));
+        assert_eq!(graph.nodes[0].name, "assets-0.tar.lz4");
+        let revision = graph.scene_revision();
+        graph.pending_archives[0].progress.set(43);
+        graph.poll_archive(started + crate::FALL_TICK / 2);
+        assert_eq!(graph.visual_label(0), "🖹 42%");
+        assert_eq!(graph.scene_revision(), revision);
+        graph.poll_archive(started + crate::FALL_TICK);
+        assert_eq!(graph.visual_label(0), "🖹 43%");
+        graph.poll_archive(started + std::time::Duration::from_millis(3000));
+        assert_eq!(graph.visual_label(0), "🖹 assets-0.tar.lz4");
+        graph.poll_archive(started + std::time::Duration::from_millis(4000));
+        assert_eq!(graph.visual_label(0), "🖹 43%");
+        done.set(true);
+        assert!(graph.poll_archive(started + std::time::Duration::from_millis(4090)).is_some());
+        assert_eq!(graph.visual_label(0), "🖹 assets-0.tar.lz4");
+        assert_eq!(graph.visual_label(1), "🖹 67%");
+        assert_eq!(graph.pending_archives.len(), 1);
+    }
+
+    #[test]
+    fn archive_label_alternates_three_seconds_of_progress_and_one_of_filename() {
+        use std::time::Duration;
+        for (ms, expected) in [(0, Some(42)), (2999, Some(42)), (3000, None),
+            (3999, None), (4000, Some(42)), (7000, None), (8000, Some(42))] {
+            assert_eq!(super::unpack_label_percent(Duration::from_millis(ms), 42), expected);
+        }
     }
 
     #[test]
@@ -2559,7 +2666,7 @@ mod tests {
             suppressed_parent_edges: Vec::new(),
             depth_limit: DEFAULT_DEPTH_LIMIT,
             scene_revision: 0,
-            pending_archive: None,
+            pending_archives: Vec::new(),
         };
         for content_type in [ContentTypeId::MATROSKA, ContentTypeId::MP4] {
             graph.nodes[0].content_type = content_type;
