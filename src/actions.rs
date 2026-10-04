@@ -380,7 +380,10 @@ impl MenuState {
             | MenuCommand::Exit => true,
             // A digest describes one byte stream. Multi-file selection leaves
             // it unavailable rather than implying a made-up combined hash.
-            MenuCommand::Sha256 => matches!(context, MenuContext::File | MenuContext::ImageFile | MenuContext::VideoFile),
+            MenuCommand::Sha256 => matches!(
+                context,
+                MenuContext::File | MenuContext::ImageFile | MenuContext::VideoFile
+            ),
             MenuCommand::Zip => context != MenuContext::None,
             MenuCommand::Enter => matches!(context, MenuContext::Folder | MenuContext::ImageFolder),
             MenuCommand::Show => matches!(
@@ -587,6 +590,9 @@ pub enum PendingAction {
     Rename {
         source: usize,
     },
+    ExtractArchive {
+        source: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -751,6 +757,19 @@ impl Modal {
         }
     }
 
+    pub fn extract_archive(source: usize, default_folder: String) -> Self {
+        Self {
+            pending: PendingAction::ExtractArchive { source },
+            title: "Extract archive".to_owned(),
+            lines: vec!["Destination folder:".to_owned()],
+            mode: ModalMode::Input {
+                value: default_folder,
+                accept_label: "extract",
+            },
+            trash_origin_y: None,
+        }
+    }
+
     pub fn rename(graph: &GraphView, source: usize) -> Self {
         let current = graph
             .node(source)
@@ -898,7 +917,9 @@ pub fn dispatch_menu_selected(
         },
         MenuCommand::Play => match selected.and_then(|id| graph.video_path_for_node(id).ok()) {
             Some(path) => Ok(Dispatch::Play(path)),
-            None => Ok(Dispatch::Status("PLY FAILED · select one inferred MP4 or MKV file".to_string())),
+            None => Ok(Dispatch::Status(
+                "PLY FAILED · select one inferred MP4 or MKV file".to_string(),
+            )),
         },
         MenuCommand::Sha256 => match selected {
             Some(source) => match graph.sha256_node(source) {
@@ -909,11 +930,22 @@ pub fn dispatch_menu_selected(
                 "SHA256 · select one file first".to_string(),
             )),
         },
-        MenuCommand::Zip => match selected {
-            Some(source) => Ok(Dispatch::Status(match graph.archive_node(source) {
-                Ok(status) => status,
-                Err(err) => format!("ARCHIVE FAILED · {err}"),
-            })),
+        MenuCommand::Zip => match selected.or_else(|| {
+            selected_files
+                .first()
+                .copied()
+                .filter(|_| selected_files.len() == 1)
+        }) {
+            Some(source) => {
+                if let Some(folder) = graph.archive_default_folder(source) {
+                    Ok(Dispatch::Modal(Modal::extract_archive(source, folder)))
+                } else {
+                    Ok(Dispatch::Status(match graph.archive_node(source) {
+                        Ok(status) => status,
+                        Err(err) => format!("ARCHIVE FAILED · {err}"),
+                    }))
+                }
+            }
             None if !selected_files.is_empty() => Ok(Dispatch::Status(
                 match graph.archive_nodes(selected_files) {
                     Ok(status) => status,
@@ -1027,6 +1059,14 @@ pub fn execute_modal(modal: Modal, graph: &mut GraphView) -> io::Result<ActionOu
         PendingAction::NewFile { parent } => {
             let name = modal.input_value().unwrap_or("").trim().to_string();
             let status = graph.create_file(parent, &name)?;
+            Ok(ActionOutcome {
+                status,
+                trashed_label: None,
+            })
+        }
+        PendingAction::ExtractArchive { source } => {
+            let name = modal.input_value().unwrap_or("").trim();
+            let status = graph.extract_archive_node(source, name)?;
             Ok(ActionOutcome {
                 status,
                 trashed_label: None,
@@ -1269,6 +1309,17 @@ mod tests {
     use super::{MenuCommand, MenuContext, MenuState, Modal, PendingAction};
 
     #[test]
+    fn extraction_modal_prefills_an_editable_folder_name() {
+        let modal = Modal::extract_archive(7, "assets".into());
+        assert!(modal.is_input());
+        assert_eq!(modal.input_value(), Some("assets"));
+        assert!(matches!(
+            modal.pending,
+            PendingAction::ExtractArchive { source: 7 }
+        ));
+    }
+
+    #[test]
     fn name_action_is_visible_and_clickable_for_files_and_folders() {
         let index = MenuState::index_for_command(MenuCommand::Rename).unwrap();
         for context in [MenuContext::File, MenuContext::Folder] {
@@ -1316,9 +1367,15 @@ mod tests {
     #[test]
     fn play_is_only_visible_for_one_video_file() {
         let play = MenuState::index_for_command(MenuCommand::Play).unwrap();
-        for context in [MenuContext::None, MenuContext::File, MenuContext::Files,
-            MenuContext::ImageFile, MenuContext::ImageFiles, MenuContext::Folder,
-            MenuContext::ImageFolder] {
+        for context in [
+            MenuContext::None,
+            MenuContext::File,
+            MenuContext::Files,
+            MenuContext::ImageFile,
+            MenuContext::ImageFiles,
+            MenuContext::Folder,
+            MenuContext::ImageFolder,
+        ] {
             assert!(!MenuState::is_visible(play, context));
         }
         assert!(MenuState::is_visible(play, MenuContext::VideoFile));

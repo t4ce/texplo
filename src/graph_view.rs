@@ -67,6 +67,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex
 }
 
+fn archive_suffix(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    [".tar.lz4", ".tar.mz4", ".7z"]
+        .into_iter()
+        .find(|suffix| lower.ends_with(suffix))
+}
+
 fn unique_archive_destination(
     preferred: &Path,
     keep_archive_extension: bool,
@@ -85,11 +92,7 @@ fn unique_archive_destination(
             )
         })?;
     let extension = if keep_archive_extension {
-        if name.to_ascii_lowercase().ends_with(".tar.lz4") {
-            ".tar.lz4"
-        } else {
-            ".7z"
-        }
+        archive_suffix(name).unwrap_or(".7z")
     } else {
         ""
     };
@@ -286,6 +289,7 @@ struct PendingArchive {
         std::pin::Pin<Box<dyn std::future::Future<Output = Result<trueos::archive::Report, i32>>>>,
     destination: String,
     label: &'static str,
+    last_marker: std::time::Instant,
 }
 
 pub struct GraphView {
@@ -986,22 +990,36 @@ impl GraphView {
     }
 
     pub fn video_path_for_node(&self, id: usize) -> io::Result<String> {
-        let node = self.node(id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "selected file no longer exists"))?;
-        if node.is_dir || node.is_placeholder || node.is_removed || node.is_moved || node.hidden
-            || !is_playable_video_type(node.content_type) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "select one inferred MP4 or MKV file"));
+        let node = self.node(id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "selected file no longer exists")
+        })?;
+        if node.is_dir
+            || node.is_placeholder
+            || node.is_removed
+            || node.is_moved
+            || node.hidden
+            || !is_playable_video_type(node.content_type)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "select one inferred MP4 or MKV file",
+            ));
         }
         let path = path_to_utf8(&node.path)?;
         if path.starts_with("trueosfs:disc") {
             return Ok(path.to_string());
         }
         if !path.starts_with('/') {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "video path is outside TRUEOSFS"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "video path is outside TRUEOSFS",
+            ));
         }
         let mounts = async_fs::block_on(async_fs::list_mounts())
             .map_err(|err| trueos_fs_err("list_mounts", err))?;
-        let primary = mounts.iter().find(|mount| mount.primary)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "primary TRUEOSFS disc unavailable"))?;
+        let primary = mounts.iter().find(|mount| mount.primary).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "primary TRUEOSFS disc unavailable")
+        })?;
         Ok(format!("{}{}", primary.selector, path))
     }
 
@@ -1080,7 +1098,32 @@ impl GraphView {
         })
     }
 
+    pub fn archive_default_folder(&self, id: usize) -> Option<String> {
+        let node = self.node(id)?;
+        if node.is_dir || node.is_placeholder || node.is_removed || node.is_moved || node.hidden {
+            return None;
+        }
+        let suffix = archive_suffix(&node.name)?;
+        Some(node.name[..node.name.len() - suffix.len()].to_owned())
+    }
+
+    pub fn extract_archive_node(&mut self, id: usize, folder: &str) -> io::Result<String> {
+        validate_name(folder)?;
+        if self.archive_default_folder(id).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "select an archive file",
+            ));
+        }
+        self.archive_node_with_folder(id, Some(folder.trim()))
+    }
+
     pub fn archive_node(&mut self, id: usize) -> io::Result<String> {
+        self.archive_node_with_folder(id, None)
+    }
+
+    fn archive_node_with_folder(&mut self, id: usize, folder: Option<&str>) -> io::Result<String> {
+        crate::archive_log(format_args!("termdir/archive: phase=prepare node={id} folder={folder:?} busy={}", self.pending_archive.is_some()));
         if self.pending_archive.is_some() {
             return Ok("ARCHIVE · an operation is already running".into());
         }
@@ -1095,14 +1138,12 @@ impl GraphView {
         }
 
         let source = node.path.clone();
+        crate::archive_log(format_args!("termdir/archive: phase=source path={:?} directory={}", source, node.is_dir));
         let source_text = path_to_utf8(&source)?;
-        let lower = source_text.to_ascii_lowercase();
-        let suffix = if lower.ends_with(".tar.lz4") {
-            Some(".tar.lz4")
-        } else if lower.ends_with(".7z") {
-            Some(".7z")
-        } else {
+        let suffix = if node.is_dir {
             None
+        } else {
+            archive_suffix(source_text)
         };
         let extracting = suffix.is_some();
         let label = if suffix == Some(".7z") { "7Z" } else { "LZ4" };
@@ -1116,13 +1157,29 @@ impl GraphView {
                 "archive path has no output name",
             ));
         }
-        let destination = unique_archive_destination(&preferred, !extracting)?;
+        let destination = if let Some(folder) = folder {
+            let destination = source
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(folder);
+            if trueos_exists(&destination)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination folder already exists",
+                ));
+            }
+            destination
+        } else {
+            unique_archive_destination(&preferred, !extracting)?
+        };
 
         let source = path_to_utf8(&source)?.to_owned();
         let destination = path_to_utf8(&destination)?.to_owned();
         let target = destination.clone();
+        crate::archive_log(format_args!("termdir/archive: phase=future-created extracting={extracting} source={source:?} destination={destination:?}"));
         self.pending_archive = Some(PendingArchive {
             future: Box::pin(async move {
+                crate::archive_log(format_args!("termdir/archive: phase=api-call extracting={extracting} source={source:?} destination={target:?}"));
                 if extracting {
                     trueos::archive::unpack(source.as_bytes(), target.as_bytes()).await
                 } else {
@@ -1131,6 +1188,7 @@ impl GraphView {
             }),
             destination: destination.clone(),
             label,
+            last_marker: std::time::Instant::now(),
         });
         Ok(format!("{label} · running · {destination}"))
     }
@@ -1139,12 +1197,17 @@ impl GraphView {
     /// this future only starts the request and observes its operation handle.
     pub fn poll_archive(&mut self) -> Option<String> {
         let pending = self.pending_archive.as_mut()?;
+        if pending.last_marker.elapsed() >= std::time::Duration::from_secs(5) {
+            crate::archive_log(format_args!("termdir/archive: phase=ui-wait destination={:?}", pending.destination));
+            pending.last_marker = std::time::Instant::now();
+        }
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         let result = match pending.future.as_mut().poll(&mut context) {
             std::task::Poll::Pending => return None,
             std::task::Poll::Ready(result) => result,
         };
         let pending = self.pending_archive.take().unwrap();
+        crate::archive_log(format_args!("termdir/archive: phase=api-return destination={:?} result={result:?}", pending.destination));
         Some(match result {
             Ok(report) => {
                 let status = format!(
@@ -1188,11 +1251,13 @@ impl GraphView {
         let target = destination.clone();
         self.pending_archive = Some(PendingArchive {
             future: Box::pin(async move {
+                crate::archive_log(format_args!("termdir/archive: phase=api-call pack-many sources={source_paths:?} destination={target:?}"));
                 let paths: Vec<_> = source_paths.iter().map(|path| path.as_bytes()).collect();
                 trueos::archive::pack_many(&paths, target.as_bytes()).await
             }),
             destination: destination.clone(),
             label: "LZ4",
+            last_marker: std::time::Instant::now(),
         });
         Ok(format!("LZ4 · running · {destination}"))
     }
@@ -2070,9 +2135,11 @@ impl GraphView {
 }
 
 pub fn is_playable_video_type(content_type: trueos::content_identity::ContentTypeId) -> bool {
-    matches!(content_type,
+    matches!(
+        content_type,
         trueos::content_identity::ContentTypeId::MP4
-            | trueos::content_identity::ContentTypeId::MATROSKA)
+            | trueos::content_identity::ContentTypeId::MATROSKA
+    )
 }
 
 fn is_viewable_image_type(content_type: trueos::content_identity::ContentTypeId) -> bool {
@@ -2401,6 +2468,20 @@ mod tests {
     use super::sha256_hex;
 
     #[test]
+    fn archive_suffix_preserves_the_entire_archive_stem() {
+        for (name, expected) in [
+            ("assets.tar.mz4", "assets"),
+            ("assets.tar.lz4", "assets"),
+            ("My.Assets.TAR.MZ4", "My.Assets"),
+            ("assets.7z", "assets"),
+        ] {
+            let suffix = super::archive_suffix(name).unwrap();
+            assert_eq!(&name[..name.len() - suffix.len()], expected);
+        }
+        assert!(super::archive_suffix("notes.txt").is_none());
+    }
+
+    #[test]
     fn archive_operation_polls_once_and_rejects_duplicate_start() {
         use super::*;
         use std::{cell::Cell, rc::Rc, task::Poll};
@@ -2430,6 +2511,7 @@ mod tests {
                 })),
                 destination: "test.tar.lz4".into(),
                 label: "LZ4",
+                last_marker: std::time::Instant::now(),
             }),
         };
         assert!(graph.poll_archive().is_none());
@@ -2455,22 +2537,36 @@ mod tests {
         let mut graph = GraphView {
             root: PathBuf::new(),
             nodes: vec![FsNode {
-                id: 0, parent: None,
+                id: 0,
+                parent: None,
                 path: PathBuf::from("trueosfs:disc7/movie.bin"),
-                name: "movie.bin".into(), is_dir: false,
+                name: "movie.bin".into(),
+                is_dir: false,
                 content_type: ContentTypeId::MATROSKA,
-                is_placeholder: false, is_removed: false, is_moved: false,
-                hidden: false, depth: 0,
+                is_placeholder: false,
+                is_removed: false,
+                is_moved: false,
+                hidden: false,
+                depth: 0,
             }],
-            positions: Vec::new(), edge_cells: Vec::new(),
-            camera_x: 0, camera_y: 0, column_gap: 18,
-            layout_mode: LayoutMode::Tree, line_style: LineStyle::Default,
-            suppressed_parent_edges: Vec::new(), depth_limit: DEFAULT_DEPTH_LIMIT,
-            scene_revision: 0, pending_archive: None,
+            positions: Vec::new(),
+            edge_cells: Vec::new(),
+            camera_x: 0,
+            camera_y: 0,
+            column_gap: 18,
+            layout_mode: LayoutMode::Tree,
+            line_style: LineStyle::Default,
+            suppressed_parent_edges: Vec::new(),
+            depth_limit: DEFAULT_DEPTH_LIMIT,
+            scene_revision: 0,
+            pending_archive: None,
         };
         for content_type in [ContentTypeId::MATROSKA, ContentTypeId::MP4] {
             graph.nodes[0].content_type = content_type;
-            assert_eq!(graph.video_path_for_node(0).unwrap(), "trueosfs:disc7/movie.bin");
+            assert_eq!(
+                graph.video_path_for_node(0).unwrap(),
+                "trueosfs:disc7/movie.bin"
+            );
         }
         graph.nodes[0].path = PathBuf::from("trueosfs:disc7/movie.mkv");
         graph.nodes[0].content_type = ContentTypeId::BLOB;

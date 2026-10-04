@@ -6,6 +6,15 @@ mod menu_view;
 mod minimap;
 mod screen;
 
+fn archive_log(message: std::fmt::Arguments<'_>) {
+    // Host UI tests have no kernel log C ABI. Production records go through
+    // log_os, never stdout (which belongs to the terminal renderer).
+    #[cfg(not(test))]
+    let _ = trueos::logl::log_record(trueos::logl::level::INFO, "apps", message);
+    #[cfg(test)]
+    let _ = message;
+}
+
 use std::{
     collections::VecDeque,
     env,
@@ -445,6 +454,7 @@ struct App {
     minimap: Minimap,
     minimap_visible: bool,
     modal: Option<Modal>,
+    action_status: Option<String>,
     logs: VecDeque<String>,
     falling: Option<FallingGhost>,
     links: Vec<MenuLink>,
@@ -501,6 +511,7 @@ impl App {
             minimap: Minimap::default(),
             minimap_visible: true,
             modal: None,
+            action_status: None,
             logs,
             falling: None,
             links: Vec::new(),
@@ -524,6 +535,7 @@ impl App {
             .image_paths_for_selection(selected, &[])
             .unwrap_or_default();
         if changed {
+            self.action_status = None;
             self.selected_sha256 = None;
             self.mark_dirty();
         }
@@ -624,7 +636,10 @@ impl App {
     }
 
     fn log(&mut self, message: impl Into<String>) {
-        self.logs.push_back(format!("⇝ {}", message.into()));
+        let message = message.into();
+        self.action_status = Some(message.clone());
+        archive_log(format_args!("termdir/archive: phase=ui-status message={message:?}"));
+        self.logs.push_back(format!("⇝ {message}"));
         while self.logs.len() > LOG_ROWS as usize {
             self.logs.pop_front();
         }
@@ -717,6 +732,8 @@ fn run_terminal_session(
     let mut out = BufWriter::with_capacity(FRAME_OUTPUT_BUFFER_CAPACITY, stdout.lock());
     let mut renderer = Renderer::default();
     let mut first_frame = true;
+    let mut archive_modal_presented = false;
+    archive_log(format_args!("termdir/archive: phase=session-start markers=v1"));
 
     let session_result = (|| {
         loop {
@@ -732,6 +749,11 @@ fn run_terminal_session(
             if app.dirty && app.resize_deadline.is_none() {
                 let frame = compose_frame(app)?;
                 renderer.present(&mut out, frame)?;
+                let archive_modal = app.modal.as_ref().is_some_and(|modal| matches!(modal.pending, PendingAction::ExtractArchive { .. }));
+                if archive_modal && !archive_modal_presented {
+                    archive_log(format_args!("termdir/archive: phase=modal-presented"));
+                }
+                archive_modal_presented = archive_modal;
                 app.dirty = false;
                 if first_frame {
                     first_frame_ready()?;
@@ -1030,7 +1052,17 @@ fn cycle_menu_section(app: &mut App, reverse: bool) {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        archive_log(format_args!(
+            "termdir/archive: phase=mouse-down x={} y={} selected={:?} selected_files={:?} modal={} press={} drag={} pan={}",
+            mouse.column, mouse.row, app.selected, app.selected_files,
+            app.modal.is_some(), app.press.is_some(), app.drag.is_some(), app.pan.is_some()
+        ));
+    }
     let Some(layout) = Layout::current(app.diagnostics)? else {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            archive_log(format_args!("termdir/archive: phase=mouse-rejected reason=no-layout"));
+        }
         return Ok(());
     };
 
@@ -1038,6 +1070,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             if let Some(yes) = modal_click(layout.viewport, mouse.column, mouse.row) {
                 confirm_modal(app, yes)?;
+            } else {
+                archive_log(format_args!("termdir/archive: phase=modal-click reason=outside-buttons"));
             }
         }
         return Ok(());
@@ -1138,6 +1172,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
         && app.drag.is_none()
         && app.pan.is_none()
     {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            archive_log(format_args!("termdir/archive: phase=menu-hit row={} menu_x={} context={:?}", mouse.row, layout.menu_x, app.menu_context()));
+        }
         let context = app.menu_context();
         let mount_count = app.mounts.len().saturating_add(1);
         if let Some(mount_index) = MenuState::mount_index_for_row(mouse.row, mount_count) {
@@ -1566,6 +1603,7 @@ fn open_mount(app: &mut App, index: usize) -> io::Result<()> {
 
 fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
     let entry = MENU_ENTRIES[index];
+    archive_log(format_args!("termdir/archive: phase=dispatch command={:?} selected={:?} files={:?}", entry.command, app.selected, app.selected_files));
     if entry.command == actions::MenuCommand::Sha256 {
         // A new SHA request supersedes the previous digest, including when it
         // fails or no item is selected.
@@ -1588,6 +1626,7 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
             Err(error) => app.log(format!("PLY FAILED · host request code={error}")),
         },
         Dispatch::Modal(mut modal) => {
+            archive_log(format_args!("termdir/archive: phase=modal-open action={:?} value={:?}", modal.pending, modal.input_value()));
             if modal.trash_origin_y.is_none() {
                 let trash_source = match &modal.pending {
                     PendingAction::Trash { source } => Some(*source),
@@ -1647,6 +1686,7 @@ fn confirm_modal(app: &mut App, yes: bool) -> io::Result<()> {
     let Some(modal) = app.modal.take() else {
         return Ok(());
     };
+    archive_log(format_args!("termdir/archive: phase=modal-confirm yes={yes} action={:?} value={:?}", modal.pending, modal.input_value()));
 
     if !yes {
         app.pending_clip_move = None;
@@ -2202,6 +2242,11 @@ fn draw_falling(frame: &mut Frame, falling: &FallingGhost, layout: Layout) {
 }
 
 fn draw_bottom_rule(frame: &mut Frame, app: &App, menu_x: u16, y: u16) {
+    // Actions must remain observable with the optional diagnostic panel off.
+    if let Some(status) = &app.action_status {
+        draw_rule_title(frame, FRAME_X, y, menu_x, status, "🞁", "🞃", true);
+        return;
+    }
     if app.selected_files.len() > 1 {
         draw_rule_title(
             frame,
