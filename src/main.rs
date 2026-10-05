@@ -20,8 +20,9 @@ use std::{
     env,
     io::{self, BufWriter, stdout},
     path::{Component, Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
+use std::time::Instant;
 
 use std::io::Write;
 
