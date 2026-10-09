@@ -1779,6 +1779,30 @@ impl GraphView {
         ))
     }
 
+    pub fn move_paths(&mut self, sources: &[PathBuf], target: &Path) -> io::Result<String> {
+        if sources.is_empty() || !trueos_is_dir(target)? {
+            return Err(io::Error::other("invalid folder move"));
+        }
+        // Validate every destination before moving any member of the payload.
+        let mut destinations = BTreeSet::new();
+        for source in sources {
+            if !self.can_move_path(source, target) || !trueos_exists(source)? {
+                return Err(io::Error::other("invalid or missing drag source"));
+            }
+            let name = source
+                .file_name()
+                .ok_or_else(|| io::Error::other("source has no file name"))?;
+            let destination = target.join(name);
+            if !destinations.insert(destination.clone()) || trueos_exists(&destination)? {
+                return Err(io::Error::other("drag destination already exists"));
+            }
+        }
+        for source in sources {
+            self.move_path(source, target)?;
+        }
+        Ok(format!("MOVE · {} entities → {}", sources.len(), target.display()))
+    }
+
     pub fn trash_node(&mut self, source: usize) -> io::Result<String> {
         if source == 0 {
             return Err(io::Error::new(

@@ -575,6 +575,7 @@ pub enum PendingAction {
         source: PathBuf,
         target: PathBuf,
     },
+    MovePaths { sources: Vec<PathBuf>, target: PathBuf },
     Trash {
         source: usize,
     },
@@ -687,6 +688,26 @@ impl Modal {
             title: "Confirm".to_string(),
             lines: vec![
                 format!("Move {label}"),
+                format!("into {} ?", target.display()),
+            ],
+            mode: ModalMode::Confirm,
+            trash_origin_y: None,
+        }
+    }
+
+    pub fn move_paths(sources: Vec<PathBuf>, target: PathBuf) -> Self {
+        if sources.len() == 1 {
+            return Self::move_path(sources[0].clone(), target);
+        }
+        let count = sources.len();
+        Self {
+            pending: PendingAction::MovePaths {
+                sources,
+                target: target.clone(),
+            },
+            title: "Confirm".to_string(),
+            lines: vec![
+                format!("Move {count} entities"),
                 format!("into {} ?", target.display()),
             ],
             mode: ModalMode::Confirm,
@@ -1032,6 +1053,10 @@ pub fn execute_modal(modal: Modal, graph: &mut GraphView) -> io::Result<ActionOu
                 status,
                 trashed_label: None,
             })
+        }
+        PendingAction::MovePaths { sources, target } => {
+            let status = graph.move_paths(&sources, &target)?;
+            Ok(ActionOutcome { status, trashed_label: None })
         }
         PendingAction::Trash { source } => {
             let label = graph.label(source);

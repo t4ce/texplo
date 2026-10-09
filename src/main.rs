@@ -1,5 +1,6 @@
 mod actions;
 mod chronos;
+mod drag_preview;
 mod graph_view;
 mod layout;
 mod menu_view;
@@ -446,6 +447,7 @@ struct App {
     path_hover: Option<PathBuf>,
     press: Option<Press>,
     drag: Option<DragState>,
+    drag_preview: Option<drag_preview::Preview>,
     clip_press: Option<ClipPress>,
     clip_drag: Option<ClipDragState>,
     pending_clip_move: Option<PendingClipMove>,
@@ -503,6 +505,7 @@ impl App {
             path_hover: None,
             press: None,
             drag: None,
+            drag_preview: None,
             clip_press: None,
             clip_drag: None,
             pending_clip_move: None,
@@ -654,6 +657,7 @@ impl App {
     }
 
     fn clear_transient(&mut self) {
+        self.drag_preview = None;
         self.press = None;
         self.drag = None;
         self.clip_press = None;
@@ -725,6 +729,7 @@ fn run_terminal_session(
 ) -> io::Result<()> {
     app.should_exit = false;
     app.should_shutdown = false;
+    app.clear_transient();
     app.resize_deadline = None;
     app.dirty = true;
 
@@ -741,6 +746,7 @@ fn run_terminal_session(
             let now = Instant::now();
             app.update_resize(now);
             update_animation(app, now);
+            poll_ui4_drop(app)?;
             let archive_scene = app.graph.scene_revision();
             if let Some(status) = app.graph.poll_archive(now) {
                 app.set_selected(None);
@@ -789,6 +795,7 @@ fn run_terminal_session(
     })();
 
     drop(out);
+    app.drag_preview = None;
     let restore_result = terminal_guard.restore();
     match session_result {
         Err(error) => {
@@ -1239,6 +1246,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                 camera_y,
             });
             app.press = None;
+            app.drag_preview = None;
             app.drag = None;
         }
         MouseEventKind::Down(MouseButton::Left)
@@ -1255,6 +1263,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                     }
                     app.minimap_nav = true;
                     app.press = None;
+                    app.drag_preview = None;
                     app.drag = None;
                     return Ok(());
                 }
@@ -1322,13 +1331,32 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
                         over_menu,
                     };
                     if app.drag.as_ref() != Some(&next_drag) {
+                        if app.drag.is_none() {
+                            let paths: Vec<_> = next_drag.sources.iter().filter_map(|source| app.graph.node(*source).map(|node| node.path.clone())).collect();
+                            let label = if paths.len() == 1 {
+                                app.graph.label(next_drag.sources[0])
+                            } else { format!("{} entities", paths.len()) };
+                            app.drag_preview = drag_preview::Preview::begin(&clip_text(&label, 48), &paths);
+                        }
+                        let repaint = app.drag_preview.is_none() || app.drag.as_ref().is_none_or(|previous| {
+                            previous.sources != next_drag.sources || previous.target != next_drag.target
+                                || previous.over_menu != next_drag.over_menu || previous.over_trash != next_drag.over_trash
+                        });
                         app.drag = Some(next_drag);
-                        app.mark_dirty();
+                        if repaint { app.mark_dirty(); }
                     }
                 }
             }
         }
         MouseEventKind::Up(_) => {
+            let delivered_elsewhere = app.drag_preview.take().is_some_and(|preview| preview.finish());
+            if delivered_elsewhere {
+                app.drag = None;
+                app.press = None;
+                app.set_path_hover(None);
+                app.log("DROP · delivered to another frame");
+                return Ok(());
+            }
             if let Some(drag) = app.drag.take() {
                 let path_target = (mouse.row == 0)
                     .then(|| {
@@ -1399,6 +1427,7 @@ fn handle_clip_gesture(app: &mut App, mouse: MouseEvent, layout: Layout) -> io::
             }
             let Some(link) = app.links.get(press.index).cloned() else {
                 app.clip_press = None;
+                app.drag_preview = None;
                 app.clip_drag = None;
                 return Ok(true);
             };
@@ -1412,11 +1441,25 @@ fn handle_clip_gesture(app: &mut App, mouse: MouseEvent, layout: Layout) -> io::
                 over_clip: clip_area_hit(app, layout, mouse.column, mouse.row),
             };
             if app.clip_drag.as_ref() != Some(&next) {
+                if app.clip_drag.is_none() {
+                    let label = link.path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| link.path.display().to_string());
+                    app.drag_preview = drag_preview::Preview::begin(&clip_text(&label, 48), &[link.path.clone()]);
+                }
+                let repaint = app.drag_preview.is_none() || app.clip_drag.as_ref().is_none_or(|previous| {
+                    previous.target != next.target || previous.over_clip != next.over_clip || previous.index != next.index
+                });
                 app.clip_drag = Some(next);
-                app.mark_dirty();
+                if repaint { app.mark_dirty(); }
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            if app.drag_preview.take().is_some_and(|preview| preview.finish()) {
+                app.clip_drag = None;
+                app.clip_press = None;
+                app.set_path_hover(None);
+                app.log("DROP · delivered to another frame");
+                return Ok(true);
+            }
             app.clip_press = None;
             if let Some(mut drag) = app.clip_drag.take() {
                 let Some(link) = app.links.get(drag.index).cloned() else {
@@ -1451,6 +1494,32 @@ fn handle_clip_gesture(app: &mut App, mouse: MouseEvent, layout: Layout) -> io::
         _ => {}
     }
     Ok(true)
+}
+
+fn poll_ui4_drop(app: &mut App) -> io::Result<()> {
+    let Some((x, y, paths)) = drag_preview::take_drop() else {
+        return Ok(());
+    };
+    if app.modal.is_some() {
+        app.log("DROP · finish the current action first");
+        return Ok(());
+    }
+    let Some(layout) = Layout::current(app.diagnostics)? else {
+        return Ok(());
+    };
+    let target = clip_drop_target_at(app, layout, x, y, &paths[0]);
+    if let Some(target) = target.filter(|target| {
+        paths
+            .iter()
+            .all(|source| app.graph.can_move_path(source, target))
+    }) {
+        app.pending_clip_move = None;
+        app.modal = Some(Modal::move_paths(paths, target));
+        app.mark_dirty();
+    } else {
+        app.log("DROP · target must be a valid folder");
+    }
+    Ok(())
 }
 
 fn clip_area_hit(app: &App, layout: Layout, x: u16, y: u16) -> bool {
@@ -1852,10 +1921,10 @@ fn compose_frame(app: &mut App) -> io::Result<Frame> {
         app.minimap.draw(&mut frame, &app.graph, layout.viewport);
     }
 
-    if let Some(drag) = app.drag.as_ref() {
+    if let Some(drag) = app.drag.as_ref().filter(|_| app.drag_preview.is_none()) {
         draw_drag_box(&mut frame, app, drag, layout);
     }
-    if let Some(drag) = app.clip_drag.as_ref() {
+    if let Some(drag) = app.clip_drag.as_ref().filter(|_| app.drag_preview.is_none()) {
         draw_clip_drag_box(&mut frame, app, drag, layout);
     }
     if let Some(falling) = &app.falling {
