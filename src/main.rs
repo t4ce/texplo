@@ -1,4 +1,6 @@
 mod actions;
+mod backend;
+mod native_ui4;
 mod chronos;
 mod drag_preview;
 mod graph_view;
@@ -26,6 +28,7 @@ use std::{
 use std::time::Instant;
 
 use std::io::Write;
+use backend::Backend;
 
 use actions::{
     Dispatch, MENU_ENTRIES, MenuContext, MenuLink, MenuSection, MenuState, Modal, MountLink,
@@ -68,13 +71,14 @@ const BREADCRUMB_ROOT_LABEL: &str = "root";
 
 #[derive(Clone)]
 struct Config {
+    backend: Backend,
     diagnostics: bool,
     initial_path: Option<PathBuf>,
     initial_depth: Option<usize>,
 }
 
 impl Config {
-    fn from_args() -> Self {
+    fn from_args() -> io::Result<Self> {
         let mut diagnostics = env::var("EXPLORER_DIAGNOSTICS")
             .ok()
             .map(|value| {
@@ -85,13 +89,22 @@ impl Config {
             })
             .unwrap_or(false);
 
-        let (mut initial_path, initial_depth) = {
-            let directives = launch_directives();
-            (directives.browse_path, directives.depth)
-        };
+        let directives = launch_directives();
+        if let Some(error) = directives.backend_error {
+            return Err(io::Error::other(error));
+        }
+        let mut backend = directives.backend;
+        let mut initial_path = directives.browse_path;
+        let initial_depth = directives.depth;
+        let mut backend_value = false;
         let mut browse_value = false;
 
         for arg in env::args().skip(1) {
+            if backend_value {
+                backend = Backend::parse(&arg).map_err(io::Error::other)?;
+                backend_value = false;
+                continue;
+            }
             if browse_value {
                 initial_path = Some(PathBuf::from(arg));
                 browse_value = false;
@@ -103,6 +116,10 @@ impl Config {
                 }
                 "--no-diagnostics" | "--no-diagnostic" => {
                     diagnostics = false;
+                }
+                "--backend" => backend_value = true,
+                _ if arg.starts_with("--backend=") => {
+                    backend = Backend::parse(&arg["--backend=".len()..]).map_err(io::Error::other)?;
                 }
                 "--browse" | "--path" => browse_value = true,
                 _ if arg.starts_with("--browse=") => {
@@ -119,16 +136,22 @@ impl Config {
             initial_path = Some(PathBuf::from("/"));
         }
 
-        Self {
+        if backend_value {
+            return Err(io::Error::other("--backend requires ui4 or terminal"));
+        }
+        Ok(Self {
+            backend,
             diagnostics,
             initial_path,
             initial_depth,
-        }
+        })
     }
 }
 
 #[derive(Default)]
 struct LaunchDirectives {
+    backend: Backend,
+    backend_error: Option<String>,
     browse_path: Option<PathBuf>,
     depth: Option<usize>,
 }
@@ -146,6 +169,13 @@ fn launch_directives() -> LaunchDirectives {
 fn launch_directives_from_script(script: &str) -> LaunchDirectives {
     let mut directives = LaunchDirectives::default();
     for line in script.lines().map(str::trim) {
+        if line == "backend" || line.starts_with("backend ") {
+            match Backend::parse(line.strip_prefix("backend").unwrap().trim()) {
+                Ok(backend) => { directives.backend = backend; directives.backend_error = None; }
+                Err(error) => directives.backend_error = Some(error),
+            }
+            continue;
+        }
         let browse = line
             .strip_prefix("browse ")
             .map(str::trim)
@@ -179,6 +209,19 @@ mod launch_script_tests {
         text_cell_width,
     };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn native_chrome_backend_is_explicit_and_invalid_values_fail() {
+        use super::Backend;
+        assert_eq!(launch_directives_from_script("browse /\n").backend, Backend::Terminal);
+        let native = launch_directives_from_script("backend ui4\nbrowse /\ndepth 2");
+        assert_eq!(native.backend, Backend::Ui4);
+        assert!(native.backend_error.is_none());
+        let remote = launch_directives_from_script("backend terminal\n");
+        assert_eq!(remote.backend, Backend::Terminal);
+        assert!(launch_directives_from_script("backend typo\n").backend_error.is_some());
+        assert!(launch_directives_from_script("backend\n").backend_error.is_some());
+    }
 
     #[test]
     fn uses_the_last_nonempty_browse_directive() {
@@ -310,6 +353,10 @@ mod launch_script_tests {
     }
 }
 
+#[cfg(test)]
+fn available_mounts() -> io::Result<Vec<MountLink>> { Ok(Vec::new()) }
+
+#[cfg(not(test))]
 fn available_mounts() -> io::Result<Vec<MountLink>> {
     let mounts = trueos::async_fs::block_on(trueos::async_fs::list_mounts()).map_err(|error| {
         io::Error::other(format!(
@@ -436,6 +483,7 @@ struct FallingGhost {
 }
 
 struct App {
+    native_extent: Option<(u32, u32)>,
     graph: GraphView,
     selected: Option<usize>,
     /// A toggle-selected set of regular files that all share one immediate
@@ -472,9 +520,13 @@ struct App {
 
 impl App {
     fn new(config: Config) -> io::Result<Self> {
-        let mut graph = match config.initial_path.as_deref() {
-            Some(path) => GraphView::from_path(path)?,
-            None => GraphView::from_current_dir()?,
+        let mut graph = if config.backend == Backend::Ui4 {
+            GraphView::empty(config.initial_path.as_deref().unwrap_or(Path::new("/")))
+        } else {
+            match config.initial_path.as_deref() {
+                Some(path) => GraphView::from_path(path)?,
+                None => GraphView::from_current_dir()?,
+            }
         };
         if let Some(depth) = config.initial_depth {
             graph.set_depth_limit(depth)?;
@@ -496,6 +548,7 @@ impl App {
         logs.push_back("⇝ Tab changes menu segment · 0..9 runs local segment item".to_string());
         logs.push_back("⇝ Esc hides TUI · tui reopens · Ctrl-Q exits app".to_string());
         Ok(Self {
+            native_extent: None,
             graph,
             selected: None,
             selected_files: Vec::new(),
@@ -527,6 +580,10 @@ impl App {
             should_shutdown: false,
             dirty: true,
         })
+    }
+
+    fn size(&self) -> io::Result<(u16, u16)> {
+        self.native_extent.map(|(width, height)| Ok(native_ui4::cell_size(width, height, self.zoom_step))).unwrap_or_else(terminal::size)
     }
 
     fn set_selected(&mut self, selected: Option<usize>) -> bool {
@@ -696,8 +753,9 @@ impl Layout {
         MIN_CONTENT_HEIGHT + if diagnostics { LOG_ROWS } else { 0 }
     }
 
-    fn current(diagnostics: bool) -> io::Result<Option<Self>> {
-        let (width, height) = terminal::size()?;
+    fn current(app: &App) -> io::Result<Option<Self>> {
+        let diagnostics = app.diagnostics;
+        let (width, height) = app.size()?;
         if width < MIN_WIDTH || height < Self::minimum_height(diagnostics) {
             return Ok(None);
         }
@@ -811,12 +869,13 @@ fn terminal_lease_io(error: trueos::vshell::TerminalLeaseError) -> io::Error {
 }
 
 fn main() -> io::Result<()> {
+    let config = Config::from_args()?;
+    if config.backend == Backend::Ui4 { return native_ui4::run(config); }
     // Bare-metal input requires the terminal lease to establish the terminal
     // route before the full application performs its VFS-backed initialization.
     // Keep the claim rollback explicit so an initialization error still returns
     // ownership to Shell2 deterministically.
     let mut lease = trueos::vshell::terminal_initial_lease().map_err(terminal_lease_io)?;
-    let config = Config::from_args();
     let mut app = match App::new(config) {
         Ok(app) => app,
         Err(error) => {
@@ -936,28 +995,28 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> io::Resu
             }
         }
         KeyCode::Left | KeyCode::Char('a') | KeyCode::Char('A') => {
-            if let Some(layout) = Layout::current(app.diagnostics)? {
+            if let Some(layout) = Layout::current(app)? {
                 if app.graph.pan_clamped(layout.viewport, 2, 0) {
                     app.mark_dirty();
                 }
             }
         }
         KeyCode::Right | KeyCode::Char('d') | KeyCode::Char('D') => {
-            if let Some(layout) = Layout::current(app.diagnostics)? {
+            if let Some(layout) = Layout::current(app)? {
                 if app.graph.pan_clamped(layout.viewport, -2, 0) {
                     app.mark_dirty();
                 }
             }
         }
         KeyCode::Up | KeyCode::Char('w') | KeyCode::Char('W') => {
-            if let Some(layout) = Layout::current(app.diagnostics)? {
+            if let Some(layout) = Layout::current(app)? {
                 if app.graph.pan_clamped(layout.viewport, 0, 2) {
                     app.mark_dirty();
                 }
             }
         }
         KeyCode::Down | KeyCode::Char('s') | KeyCode::Char('S') => {
-            if let Some(layout) = Layout::current(app.diagnostics)? {
+            if let Some(layout) = Layout::current(app)? {
                 if app.graph.pan_clamped(layout.viewport, 0, -2) {
                     app.mark_dirty();
                 }
@@ -998,7 +1057,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> io::Resu
         KeyCode::Char(ch) if ch.is_ascii_digit() => {
             let context = app.menu_context();
             if app.menu.section == MenuSection::Clip {
-                let visible = Layout::current(app.diagnostics)
+                let visible = Layout::current(app)
                     .ok()
                     .flatten()
                     .map(|layout| {
@@ -1042,7 +1101,7 @@ fn cycle_menu_section(app: &mut App, reverse: bool) {
     let context = app.menu_context();
     let mut changed = app.menu.cycle_section(reverse, context);
     if app.menu.section == MenuSection::Clip {
-        let clip_visible = Layout::current(app.diagnostics)
+        let clip_visible = Layout::current(app)
             .ok()
             .flatten()
             .and_then(|layout| {
@@ -1071,7 +1130,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
             app.modal.is_some(), app.press.is_some(), app.drag.is_some(), app.pan.is_some()
         ));
     }
-    let Some(layout) = Layout::current(app.diagnostics)? else {
+    let Some(layout) = Layout::current(app)? else {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             archive_log(format_args!("termdir/archive: phase=mouse-rejected reason=no-layout"));
         }
@@ -1504,7 +1563,7 @@ fn poll_ui4_drop(app: &mut App) -> io::Result<()> {
         app.log("DROP · finish the current action first");
         return Ok(());
     }
-    let Some(layout) = Layout::current(app.diagnostics)? else {
+    let Some(layout) = Layout::current(app)? else {
         return Ok(());
     };
     let target = clip_drop_target_at(app, layout, x, y, &paths[0]);
@@ -1565,7 +1624,7 @@ fn minimap_geometry(app: &App, layout: Layout) -> Option<minimap::MinimapGeometr
     if !app.minimap_visible {
         return None;
     }
-    let (width, height) = terminal::size().ok()?;
+    let (width, height) = app.size().ok()?;
     Minimap::geometry(width, height, layout.viewport)
 }
 
@@ -1743,16 +1802,18 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
 fn cycle_terminal_zoom(app: &mut App) -> io::Result<()> {
     let next = (app.zoom_step + 1) % ZOOM_LEVELS.len();
     let percent = ZOOM_LEVELS[next];
-    let mut output = stdout().lock();
-    write!(output, "\x1b]777;terminal_zoom={percent}\x07")?;
-    output.flush()?;
+    if app.native_extent.is_none() {
+        let mut output = stdout().lock();
+        write!(output, "\x1b]777;terminal_zoom={percent}\x07")?;
+        output.flush()?;
+    }
     app.zoom_step = next;
     app.log(format!("VIEW · zoom {percent}%"));
     Ok(())
 }
 
 fn selected_screen_y(app: &App, source: usize) -> Option<u16> {
-    let layout = Layout::current(app.diagnostics).ok().flatten()?;
+    let layout = Layout::current(app).ok().flatten()?;
     app.graph.screen_y(source, layout.viewport)
 }
 
@@ -1839,7 +1900,7 @@ fn update_animation(app: &mut App, now: Instant) {
         return;
     }
 
-    let stop_y = Layout::current(app.diagnostics)
+    let stop_y = Layout::current(app)
         .ok()
         .flatten()
         // The paper bin occupies separator_y. The icon may reach exactly one
@@ -1870,10 +1931,10 @@ fn update_animation(app: &mut App, now: Instant) {
 }
 
 fn compose_frame(app: &mut App) -> io::Result<Frame> {
-    let (width, height) = terminal::size()?;
+    let (width, height) = app.size()?;
     let mut frame = Frame::new(width, height);
 
-    let Some(layout) = Layout::current(app.diagnostics)? else {
+    let Some(layout) = Layout::current(app)? else {
         print_at(&mut frame, 0, 0, "terminal too small", Style::default());
         print_at(
             &mut frame,
@@ -1919,6 +1980,14 @@ fn compose_frame(app: &mut App) -> io::Result<Frame> {
 
     if app.minimap_visible {
         app.minimap.draw(&mut frame, &app.graph, layout.viewport);
+    }
+
+    if app.native_extent.is_some() {
+        let text = "not ready";
+        print_at(&mut frame,
+            layout.viewport.x + layout.viewport.width.saturating_sub(text.len() as u16) / 2,
+            layout.viewport.y + layout.viewport.height / 2,
+            text, Style::new(Color::DarkGrey, Color::Reset));
     }
 
     if let Some(drag) = app.drag.as_ref().filter(|_| app.drag_preview.is_none()) {

@@ -305,6 +305,7 @@ fn unpack_label_percent(elapsed: std::time::Duration, percent: u32) -> Option<u3
 }
 
 pub struct GraphView {
+    content_enabled: bool,
     root: PathBuf,
     nodes: Vec<FsNode>,
     positions: Vec<WorldPos>,
@@ -327,7 +328,22 @@ impl GraphView {
     }
 
     pub fn from_path(root: &Path) -> io::Result<Self> {
-        let mut view = Self {
+        let mut view = Self::new(root, true);
+        view.reload()?;
+        Ok(view)
+    }
+
+    /// Native chrome can navigate and operate on the root without building
+    /// the graph until its dedicated pan renderer is available.
+    pub fn empty(root: &Path) -> Self {
+        let mut view = Self::new(root, false);
+        view.reload().expect("empty graph reload performs no filesystem I/O");
+        view
+    }
+
+    fn new(root: &Path, content_enabled: bool) -> Self {
+        Self {
+            content_enabled,
             root: root.to_path_buf(),
             nodes: Vec::new(),
             positions: Vec::new(),
@@ -341,9 +357,7 @@ impl GraphView {
             depth_limit: DEFAULT_DEPTH_LIMIT,
             scene_revision: 0,
             pending_archives: Vec::new(),
-        };
-        view.reload()?;
-        Ok(view)
+        }
     }
 
     pub fn reload(&mut self) -> io::Result<()> {
@@ -373,6 +387,10 @@ impl GraphView {
             depth: 0,
         });
 
+        if !self.content_enabled {
+            self.rebuild_layout();
+            return Ok(());
+        }
         let root = self.root.clone();
         let mut remaining = MAX_VISIBLE_NODES;
         self.scan_dir(0, &root, 1, &mut remaining)?;
@@ -2561,6 +2579,7 @@ mod tests {
         let polls = Rc::new(Cell::new(0));
         let counter = polls.clone();
         let mut graph = GraphView {
+            content_enabled: true,
             root: PathBuf::new(),
             nodes: Vec::new(),
             positions: Vec::new(),
@@ -2666,6 +2685,7 @@ mod tests {
         use super::*;
         use trueos::content_identity::ContentTypeId;
         let mut graph = GraphView {
+            content_enabled: true,
             root: PathBuf::new(),
             nodes: vec![FsNode {
                 id: 0,
@@ -2713,5 +2733,21 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+}
+
+#[cfg(test)]
+mod native_chrome_tests {
+    use super::*;
+    #[test]
+    fn native_chrome_validated_mount_root_changes_keep_content_disabled() {
+        let mut graph = GraphView::empty(Path::new("/initial-root"));
+        // mount_path performs VFS validation, then sets this root and reloads.
+        graph.root = PathBuf::from("/validated-mount-root");
+        graph.reload().unwrap();
+        assert_eq!(graph.root_path(), Path::new("/validated-mount-root"));
+        assert_eq!(graph.nodes.len(), 1);
+        assert!(graph.edge_cells.is_empty());
+        assert!(graph.minimap_samples().is_empty());
     }
 }

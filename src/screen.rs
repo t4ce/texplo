@@ -98,7 +98,7 @@ impl Cell {
         }
     }
 
-    fn is_continuation(self) -> bool {
+    pub(crate) fn is_continuation(self) -> bool {
         self.width == 0
     }
 
@@ -227,7 +227,7 @@ impl Frame {
         }
     }
 
-    fn cell(&self, x: u16, y: u16) -> Cell {
+    pub(crate) fn cell(&self, x: u16, y: u16) -> Cell {
         self.cells[self.index(x, y)]
     }
 }

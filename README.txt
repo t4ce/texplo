@@ -6,6 +6,22 @@ Run from this directory:
 
     cargo run
 
+Backend selection
+-----------------
+The per-launch script accepts `backend terminal` or `backend ui4`.
+CLI equivalents: `--backend terminal` and `--backend ui4`.
+Invalid backend values fail before acquiring a terminal or opening a window.
+Omitting the directive retains the terminal backend for existing launchers.
+
+Shell3 supplies `backend ui4` when launched from its local UI4 window and
+`backend terminal` for its network frontends, including SSH.
+The native backend owns a separate UI4 frame and its input/resize/close events;
+it does not lease or render inside Shell3. It presents the existing controls,
+menus, breadcrumb, clipboard, minimap frame, and modals. The graph and minimap
+contents remain empty across reload, depth, and mount changes until the native
+pan renderer is ready. Escape, the menu close button, and Ctrl-Q close this frame.
+The terminal backend retains the complete graph and its terminal handoff.
+
 Dependency policy: std + crossterm only.
 
 Diagnostic build marker (when diagnostics are enabled):
