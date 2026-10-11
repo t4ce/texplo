@@ -35,7 +35,7 @@ pub fn draw_menu(
     // One literal gap between the stylized E and N. The extra horizontal cap
     // keeps the close glyph at the physical top-right cell of the 17-col menu.
     menu_line(frame, menu_x, 0, "├─╼ ᗰ ☰ＮＵ╾─┤🯀");
-    menu_line(frame, menu_x, 1, "│Use ⌨   Tab  ╰─╮");
+    menu_line(frame, menu_x, 1, "│Use ⌨  Tab  ╰─╮");
     menu_line(frame, menu_x, 2, "├─╼ Mount      ╾┤");
     let mount_count = mounts.len().saturating_add(1);
     let visible_mounts = MenuState::visible_mount_count(mount_count);

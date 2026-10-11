@@ -52,7 +52,8 @@ pub fn terminal_cell_width(ch: char) -> u16 {
         // Shell2's terminal treats the Japanese middle dot as wide. It is
         // used in termdir's slash-free breadcrumbs and title delimiters, so it
         // must occupy the same two cells in retained frames and hit layouts.
-        '🪦' | '☰' | 'Ｎ' | 'Ｕ' | '＃' | '・' => 2,
+        '🪦' | '☰' | 'Ｎ' | 'Ｕ' | '＃' | '・' | '⌨' => 2,
+        '🗺' => 3,
         _ => 1,
     }
 }
@@ -67,7 +68,7 @@ pub fn text_cell_width(text: &str) -> usize {
 pub struct Cell {
     pub ch: char,
     pub style: Style,
-    // 2 = lead cell of a wide glyph, 1 = ordinary glyph, 0 = continuation.
+    // >1 = lead cell with glyph width, 1 = ordinary glyph, 0 = continuation.
     width: u8,
 }
 
@@ -82,11 +83,11 @@ impl Default for Cell {
 }
 
 impl Cell {
-    fn wide(ch: char, style: Style) -> Self {
+    fn wide(ch: char, style: Style, width: u16) -> Self {
         Self {
             ch,
             style,
-            width: 2,
+            width: width as u8,
         }
     }
 
@@ -103,7 +104,7 @@ impl Cell {
     }
 
     fn is_wide(self) -> bool {
-        self.width == 2
+        self.width > 1
     }
 }
 
@@ -139,19 +140,15 @@ impl Frame {
         if x >= self.width || y >= self.height {
             return;
         }
-        let index = self.index(x, y);
-        let cell = self.cells[index];
-        if cell.is_continuation() {
-            if x > 0 {
-                let lead_index = self.index(x - 1, y);
-                self.cells[lead_index] = Cell::default();
-            }
-            self.cells[index] = Cell::default();
-        } else if cell.is_wide() {
-            self.cells[index] = Cell::default();
-            if x + 1 < self.width {
-                let continuation = self.index(x + 1, y);
-                self.cells[continuation] = Cell::default();
+        let mut lead_x = x;
+        while lead_x > 0 && self.cell(lead_x, y).is_continuation() {
+            lead_x -= 1;
+        }
+        let cell = self.cell(lead_x, y);
+        if cell.is_wide() {
+            for column in lead_x..lead_x.saturating_add(cell.width as u16).min(self.width) {
+                let index = self.index(column, y);
+                self.cells[index] = Cell::default();
             }
         }
     }
@@ -175,14 +172,20 @@ impl Frame {
         }
 
         let wanted = terminal_cell_width(ch);
-        if wanted == 2 && x + 1 < self.width {
-            self.erase_occupant(x, y);
-            self.erase_occupant(x + 1, y);
+        if wanted > 1 {
+            if wanted > self.width - x {
+                // Do not emit a partial wide icon at the right edge.
+                for column in x..self.width { self.put(column, y, ' ', style); }
+                return wanted;
+            }
+            for column in x..x + wanted { self.erase_occupant(column, y); }
             let lead = self.index(x, y);
-            let continuation = self.index(x + 1, y);
-            self.cells[lead] = Cell::wide(ch, style);
-            self.cells[continuation] = Cell::continuation(style);
-            2
+            self.cells[lead] = Cell::wide(ch, style, wanted);
+            for column in x + 1..x + wanted {
+                let index = self.index(column, y);
+                self.cells[index] = Cell::continuation(style);
+            }
+            wanted
         } else {
             self.put(x, y, ch, style);
             1
@@ -271,7 +274,7 @@ impl Renderer {
                     if cell != Cell::default() {
                         paint_run(out, x, y, cell.style, &cell.ch.to_string())?;
                     }
-                    x = x.saturating_add(2);
+                    x = x.saturating_add(cell.width as u16);
                     continue;
                 }
                 if cell == Cell::default() {
@@ -353,7 +356,7 @@ impl Renderer {
             }
             if cell.is_wide() {
                 paint_run(out, x, y, cell.style, &cell.ch.to_string())?;
-                x = x.saturating_add(2);
+                x = x.saturating_add(cell.width as u16);
                 continue;
             }
 
@@ -375,27 +378,13 @@ impl Renderer {
 }
 
 fn mark_footprint(dirty: &mut [bool], frame: &Frame, x: u16, y: u16) {
-    let width = frame.width() as usize;
-    let cell = frame.cell(x, y);
-    let x = x as usize;
-
-    if cell.is_continuation() {
-        if x > 0 {
-            dirty[x - 1] = true;
-        }
-        if x < width {
-            dirty[x] = true;
-        }
-    } else if cell.is_wide() {
-        if x < width {
-            dirty[x] = true;
-        }
-        if x + 1 < width {
-            dirty[x + 1] = true;
-        }
-    } else if x < width {
-        dirty[x] = true;
+    let mut lead_x = x;
+    while lead_x > 0 && frame.cell(lead_x, y).is_continuation() {
+        lead_x -= 1;
     }
+    let cell = frame.cell(lead_x, y);
+    let end = lead_x.saturating_add(u16::from(cell.width).max(1)).min(frame.width());
+    for column in lead_x..end { dirty[column as usize] = true; }
 }
 
 fn paint_run<W: Write>(out: &mut W, x: u16, y: u16, style: Style, text: &str) -> io::Result<()> {
@@ -420,7 +409,7 @@ fn paint_run<W: Write>(out: &mut W, x: u16, y: u16, style: Style, text: &str) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{terminal_cell_width, text_cell_width, Frame, Renderer, Style};
+    use super::{mark_footprint, terminal_cell_width, text_cell_width, Frame, Renderer, Style};
     use std::io::{self, BufWriter, Write};
 
     #[derive(Debug, Default)]
@@ -453,6 +442,31 @@ mod tests {
         let output = output.into_inner().unwrap();
         assert_eq!(output.writes, 1);
         assert!(output.bytes.windows(2).any(|window| window == b"td"));
+    }
+
+    #[test]
+    fn map_occupies_three_cells_and_clears_its_complete_footprint() {
+        assert_eq!(text_cell_width("🗺  "), 5);
+        for overwrite_x in 0..3 {
+            let mut frame = Frame::new(6, 1);
+            frame.put_str(0, 0, "🗺x", Style::default());
+            assert_eq!(frame.cell(0, 0).width, 3);
+            assert!(frame.cell(1, 0).is_continuation());
+            assert!(frame.cell(2, 0).is_continuation());
+            assert_eq!(frame.cell(3, 0).ch, 'x');
+            let mut dirty = [false; 6];
+            mark_footprint(&mut dirty, &frame, overwrite_x, 0);
+            assert_eq!(dirty, [true, true, true, false, false, false]);
+            frame.put(overwrite_x, 0, 'A', Style::default());
+            for x in 0..3 {
+                assert_eq!(frame.cell(x, 0).ch, if x == overwrite_x { 'A' } else { ' ' });
+                assert!(!frame.cell(x, 0).is_continuation());
+            }
+        }
+        let mut clipped = Frame::new(2, 1);
+        clipped.put_str(0, 0, "🗺", Style::default());
+        assert_eq!(clipped.cell(0, 0).ch, ' ');
+        assert_eq!(clipped.cell(1, 0).ch, ' ');
     }
 
     #[test]
