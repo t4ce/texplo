@@ -493,6 +493,7 @@ struct App {
     selected_sha256: Option<Sha256Result>,
     show_paths: Vec<String>,
     path_hover: Option<PathBuf>,
+    item_hover: Option<usize>,
     press: Option<Press>,
     drag: Option<DragState>,
     drag_preview: Option<drag_preview::Preview>,
@@ -556,6 +557,7 @@ impl App {
             selected_sha256: None,
             show_paths: Vec::new(),
             path_hover: None,
+            item_hover: None,
             press: None,
             drag: None,
             drag_preview: None,
@@ -1162,6 +1164,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> io::Result<()> {
             None
         };
         app.set_path_hover(hover);
+        let item_hover = app.graph.hit_test(layout.viewport, mouse.column, mouse.row);
+        if app.item_hover != item_hover {
+            app.item_hover = item_hover;
+            app.mark_dirty();
+        }
     }
 
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -1974,6 +1981,7 @@ fn compose_frame(app: &mut App) -> io::Result<Frame> {
         layout.viewport,
         app.selected,
         app.selected_files.as_slice(),
+        app.item_hover,
         drag_sources,
         drop_target,
     );

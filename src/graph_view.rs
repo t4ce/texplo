@@ -2060,7 +2060,7 @@ impl GraphView {
         drop_target: Option<usize>,
     ) {
         let drag_sources = drag_id.as_slice();
-        self.render_many(frame, viewport, selected, &[], drag_sources, drop_target);
+        self.render_many(frame, viewport, selected, &[], None, drag_sources, drop_target);
     }
 
     pub fn render_many(
@@ -2069,6 +2069,7 @@ impl GraphView {
         viewport: Viewport,
         selected: Option<usize>,
         selected_files: &[usize],
+        hovered: Option<usize>,
         drag_sources: &[usize],
         drop_target: Option<usize>,
     ) {
@@ -2099,6 +2100,9 @@ impl GraphView {
                 style = Style::new(Color::Black, Color::White);
             } else if node.is_dir {
                 style = Style::new(Color::Black, Color::White);
+            }
+            if !node.is_removed && !node.is_moved && hovered == Some(node.id) {
+                style = Style::new(Color::Black, Color::Grey);
             }
             if !node.is_removed
                 && !node.is_moved
