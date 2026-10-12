@@ -72,7 +72,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn archive_suffix(name: &str) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
-    [".tar.lz4", ".tar.mz4", ".7z"]
+    [".tar.lz4", ".tar.mz4"]
         .into_iter()
         .find(|suffix| lower.ends_with(suffix))
 }
@@ -95,7 +95,7 @@ fn unique_archive_destination(
             )
         })?;
     let extension = if keep_archive_extension {
-        archive_suffix(name).unwrap_or(".7z")
+        archive_suffix(name).unwrap_or(".tar.lz4")
     } else {
         ""
     };
@@ -1180,7 +1180,7 @@ impl GraphView {
             archive_suffix(source_text)
         };
         let extracting = suffix.is_some();
-        let label = if suffix == Some(".7z") { "7Z" } else { "LZ4" };
+        let label = "LZ4";
         let preferred = match suffix {
             Some(suffix) => PathBuf::from(&source_text[..source_text.len() - suffix.len()]),
             None => PathBuf::from(format!("{}.tar.lz4", source.display())),
@@ -2568,7 +2568,6 @@ mod tests {
             ("assets.tar.mz4", "assets"),
             ("assets.tar.lz4", "assets"),
             ("My.Assets.TAR.MZ4", "My.Assets"),
-            ("assets.7z", "assets"),
         ] {
             let suffix = super::archive_suffix(name).unwrap();
             assert_eq!(&name[..name.len() - suffix.len()], expected);
