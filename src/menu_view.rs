@@ -70,13 +70,13 @@ pub fn draw_menu(
             MenuCommand::Zoom,
             "zoom",
             Some(toggle_glyph(zoom_step.min(4), 5)),
-            Some(('┝', '┥')),
+            Some(('╭', '╮')),
         ),
         (
             MenuCommand::Depth,
             "depth",
             Some(TOGGLE_GLYPHS[depth_limit.min(7)]),
-            Some(('╭', '╮')),
+            Some(('┝', '┥')),
         ),
         (
             MenuCommand::Spacing,
