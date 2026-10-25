@@ -1,5 +1,6 @@
 mod actions;
 mod backend;
+mod edit_action;
 mod native_ui4;
 mod chronos;
 mod drag_preview;
@@ -484,6 +485,7 @@ struct FallingGhost {
 
 struct App {
     native_extent: Option<(u32, u32)>,
+    local_ui4: bool,
     graph: GraphView,
     selected: Option<usize>,
     /// A toggle-selected set of regular files that all share one immediate
@@ -550,6 +552,7 @@ impl App {
         logs.push_back("⇝ Esc hides TUI · tui reopens · Ctrl-Q exits app".to_string());
         Ok(Self {
             native_extent: None,
+            local_ui4: false,
             graph,
             selected: None,
             selected_files: Vec::new(),
@@ -680,6 +683,14 @@ impl App {
         true
     }
 
+    fn refresh_terminal_frontend(&mut self) {
+        let local = edit_action::is_local_ui4();
+        if local != self.local_ui4 {
+            self.local_ui4 = local;
+            self.mark_dirty();
+        }
+    }
+
     fn menu_context(&self) -> MenuContext {
         if self.selected_files.len() > 1 {
             return if self.show_paths.is_empty() {
@@ -689,6 +700,7 @@ impl App {
             };
         }
         match self.selected.and_then(|id| self.graph.node(id)) {
+            Some(node) if self.local_ui4 && graph_view::is_editable_text_file(node) => MenuContext::LocalTextFile,
             Some(node) if node.is_dir && !self.show_paths.is_empty() => MenuContext::ImageFolder,
             Some(node) if node.is_dir => MenuContext::Folder,
             Some(_) if !self.show_paths.is_empty() => MenuContext::ImageFile,
@@ -787,6 +799,7 @@ fn run_terminal_session(
     app: &mut App,
     mut first_frame_ready: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
+    app.refresh_terminal_frontend();
     app.should_exit = false;
     app.should_shutdown = false;
     app.clear_transient();
@@ -912,6 +925,8 @@ fn main() -> io::Result<()> {
 fn handle_event(app: &mut App, event: Event) -> io::Result<()> {
     match event {
         Event::Resize(columns, rows) => {
+            // Crossterm emits a resize on lease re-entry, including a move to SSH.
+            app.refresh_terminal_frontend();
             if rows <= 12 {
                 let _ = trueos::logl::log_record(
                     trueos::logl::level::INFO,
@@ -1765,6 +1780,19 @@ fn invoke_menu(app: &mut App, index: usize) -> io::Result<()> {
             Ok(()) => app.log("PLY · opening looping video"),
             Err(error) => app.log(format!("PLY FAILED · host request code={error}")),
         },
+        Dispatch::Edit(path) => {
+            // Recheck the live route before launching; never open a desktop
+            // window on behalf of a remote terminal.
+            app.refresh_terminal_frontend();
+            if !app.local_ui4 {
+                app.log("EDIT · separate Shell3 window requires local UI4");
+            } else {
+                match edit_action::open(&path) {
+                    Ok(()) => app.log("EDIT · requested editor in a new Shell3 window"),
+                    Err(error) => app.log(format!("EDIT FAILED · {error}")),
+                }
+            }
+        }
         Dispatch::Modal(mut modal) => {
             archive_log(format_args!("termdir/archive: phase=modal-open action={:?} value={:?}", modal.pending, modal.input_value()));
             if modal.trash_origin_y.is_none() {

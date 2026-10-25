@@ -21,6 +21,7 @@ pub enum MenuCommand {
     Zoom,
     Center,
     Enter,
+    Edit,
     Show,
     Play,
     Sha256,
@@ -36,6 +37,7 @@ pub enum MenuCommand {
 pub enum MenuContext {
     None,
     File,
+    LocalTextFile,
     ImageFile,
     VideoFile,
     Files,
@@ -78,7 +80,7 @@ pub struct MenuEntry {
 
 // The visual order is the contract from ☰enu_Rework.txt. Local hotkeys are
 // assigned after contextual filtering, so every section reuses 🯰..🯹/0..9.
-pub const MENU_ENTRIES: [MenuEntry; 16] = [
+pub const MENU_ENTRIES: [MenuEntry; 17] = [
     MenuEntry {
         label: "center",
         command: MenuCommand::Center,
@@ -108,6 +110,11 @@ pub const MENU_ENTRIES: [MenuEntry; 16] = [
         label: "layout",
         command: MenuCommand::ToggleLayout,
         section: MenuSection::View,
+    },
+    MenuEntry {
+        label: "edit",
+        command: MenuCommand::Edit,
+        section: MenuSection::Action,
     },
     MenuEntry {
         label: "enter",
@@ -382,7 +389,7 @@ impl MenuState {
             // it unavailable rather than implying a made-up combined hash.
             MenuCommand::Sha256 => matches!(
                 context,
-                MenuContext::File | MenuContext::ImageFile | MenuContext::VideoFile
+                MenuContext::File | MenuContext::LocalTextFile | MenuContext::ImageFile | MenuContext::VideoFile
             ),
             MenuCommand::Zip => context != MenuContext::None,
             MenuCommand::Enter => matches!(context, MenuContext::Folder | MenuContext::ImageFolder),
@@ -391,6 +398,7 @@ impl MenuState {
                 MenuContext::ImageFile | MenuContext::ImageFiles | MenuContext::ImageFolder
             ),
             MenuCommand::Play => context == MenuContext::VideoFile,
+            MenuCommand::Edit => context == MenuContext::LocalTextFile,
             MenuCommand::NewFolder | MenuCommand::NewFile => {
                 matches!(
                     context,
@@ -401,6 +409,7 @@ impl MenuState {
                 matches!(
                     context,
                     MenuContext::File
+                        | MenuContext::LocalTextFile
                         | MenuContext::ImageFile
                         | MenuContext::VideoFile
                         | MenuContext::Files
@@ -412,6 +421,7 @@ impl MenuState {
             MenuCommand::Rename => matches!(
                 context,
                 MenuContext::File
+                    | MenuContext::LocalTextFile
                     | MenuContext::ImageFile
                     | MenuContext::VideoFile
                     | MenuContext::Folder
@@ -851,6 +861,7 @@ pub enum Dispatch {
     Zoom,
     Show(Vec<String>),
     Play(String),
+    Edit(PathBuf),
     Modal(Modal),
     Sha256(Sha256Result),
     Status(String),
@@ -941,6 +952,10 @@ pub fn dispatch_menu_selected(
             None => Ok(Dispatch::Status(
                 "PLY FAILED · select one inferred MP4 or MKV file".to_string(),
             )),
+        },
+        MenuCommand::Edit => match selected.and_then(|id| graph.node(id)) {
+            Some(node) if crate::graph_view::is_editable_text_file(node) => Ok(Dispatch::Edit(node.path.clone())),
+            _ => Ok(Dispatch::Status("EDIT · select one .txt file".to_string())),
         },
         MenuCommand::Sha256 => match selected {
             Some(source) => match graph.sha256_node(source) {
@@ -1332,6 +1347,22 @@ fn print_at(frame: &mut Frame, x: u16, y: u16, text: &str, style: Style) {
 #[cfg(test)]
 mod tests {
     use super::{MenuCommand, MenuContext, MenuState, Modal, PendingAction};
+
+    #[test]
+    fn edit_is_the_first_action_only_for_one_local_txt_file() {
+        let edit = MenuState::index_for_command(MenuCommand::Edit).unwrap();
+        assert_eq!(MenuState::local_index(edit, MenuContext::LocalTextFile), Some(0));
+        let row = MenuState::row_for_index(edit, MenuContext::LocalTextFile, 1).unwrap();
+        assert_eq!(MenuState::index_for_row(row, MenuContext::LocalTextFile, 1), Some(edit));
+        for context in [MenuContext::None, MenuContext::File, MenuContext::Files,
+            MenuContext::ImageFile, MenuContext::ImageFiles, MenuContext::VideoFile,
+            MenuContext::Folder, MenuContext::ImageFolder] {
+            assert!(!MenuState::is_visible(edit, context));
+        }
+        for command in [MenuCommand::Rename, MenuCommand::Delete, MenuCommand::Sha256, MenuCommand::Zip] {
+            assert!(MenuState::is_visible(MenuState::index_for_command(command).unwrap(), MenuContext::LocalTextFile));
+        }
+    }
 
     #[test]
     fn extraction_modal_prefills_an_editable_folder_name() {

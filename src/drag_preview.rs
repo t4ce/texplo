@@ -53,14 +53,24 @@ pub fn take_drop() -> Option<(u16, u16, Vec<PathBuf>)> {
     }
 }
 
+// Decoration belongs to Termdir; UI4 receives only a label and opaque payload.
+fn framed_label(label: &str) -> String {
+    let text: String = label.chars().take(18)
+        .map(|ch| if ch.is_control() { ' ' } else { ch }).collect();
+    let width = text.chars().count().max(4);
+    let rule = "─".repeat(width);
+    format!("┌{rule}┐\n│{text:<width$}│\n└{rule}┘")
+}
+
 impl Preview {
     pub fn begin(label: &str, paths: &[PathBuf]) -> Option<Self> {
         let payload = encode_paths(paths)?;
+        let label = framed_label(label);
         #[cfg(not(test))]
         {
             let buffer = trueos::ui4_drag::DragBuffer::begin_attached(
                 trueos::ui4_drag::PATH_LIST_V1,
-                label,
+                &label,
                 &payload,
             )
             .ok()?;
@@ -87,6 +97,13 @@ impl Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_drag_label_has_an_app_owned_frame() {
+        assert_eq!(framed_label("file"), "┌────┐\n│file│\n└────┘");
+        assert_eq!(framed_label("a\nb"), "┌────┐\n│a b │\n└────┘");
+        assert!(framed_label(&"界".repeat(100)).len() <= trueos::ui4_drag::MAX_LABEL_BYTES);
+        assert!(framed_label(&"界".repeat(100)).lines().all(|line| line.chars().count() == 20));
+    }
     #[test]
     fn payload_preserves_unicode_and_newlines_without_separator_ambiguity() {
         let paths = [PathBuf::from("4:/hello\nworld"), PathBuf::from("4:/§file")];

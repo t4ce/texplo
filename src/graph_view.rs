@@ -176,6 +176,12 @@ pub struct FsNode {
     depth: usize,
 }
 
+pub fn is_editable_text_file(node: &FsNode) -> bool {
+    !node.is_dir && !node.is_placeholder && !node.is_removed && !node.is_moved && !node.hidden
+        && node.path.extension().and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+}
+
 #[derive(Clone, Debug)]
 pub struct SelectionStats {
     pub key: String,
@@ -2681,6 +2687,37 @@ mod tests {
             (3999, None), (4000, Some(42)), (7000, None), (8000, Some(42))] {
             assert_eq!(super::unpack_label_percent(Duration::from_millis(ms), 42), expected);
         }
+    }
+
+    #[test]
+    fn edit_dispatch_requires_one_live_txt_file_and_preserves_its_disc() {
+        use super::*;
+        use crate::actions::{dispatch_menu_selected, Dispatch, MenuCommand};
+        let mut graph = GraphView::new(Path::new("trueosfs:disc7"), false);
+        graph.nodes.push(FsNode {
+            id: 0, parent: None, path: PathBuf::from("trueosfs:disc7/My notes/note.TXT"),
+            name: "note.TXT".into(), is_dir: false,
+            content_type: trueos::content_identity::ContentTypeId::BLOB,
+            is_placeholder: false, is_removed: false, is_moved: false, hidden: false, depth: 0,
+        });
+        for files in [vec![], vec![0]] {
+            let result = dispatch_menu_selected(MenuCommand::Edit, &mut graph, Some(0), &files).unwrap();
+            assert!(matches!(result, Dispatch::Edit(ref path) if path == Path::new("trueosfs:disc7/My notes/note.TXT")));
+        }
+        for (selected, files) in [(None, vec![]), (Some(0), vec![0, 1])] {
+            assert!(matches!(dispatch_menu_selected(MenuCommand::Edit, &mut graph, selected, &files).unwrap(), Dispatch::Status(_)));
+        }
+        graph.nodes[0].path = PathBuf::from("trueosfs:disc7/note.md");
+        assert!(!is_editable_text_file(&graph.nodes[0]));
+        graph.nodes[0].path = PathBuf::from("trueosfs:disc7/note.txt");
+        graph.nodes[0].is_dir = true;
+        assert!(!is_editable_text_file(&graph.nodes[0]));
+        graph.nodes[0].is_dir = false;
+        graph.nodes[0].is_removed = true;
+        assert!(!is_editable_text_file(&graph.nodes[0]));
+        graph.nodes[0].is_removed = false;
+        graph.nodes[0].hidden = true;
+        assert!(!is_editable_text_file(&graph.nodes[0]));
     }
 
     #[test]

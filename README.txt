@@ -13,14 +13,26 @@ CLI equivalents: `--backend terminal` and `--backend ui4`.
 Invalid backend values fail before acquiring a terminal or opening a window.
 Omitting the directive retains the terminal backend for existing launchers.
 
-Shell3 supplies `backend ui4` when launched from its local UI4 window and
-`backend terminal` for its network frontends, including SSH.
-The native backend owns a separate UI4 frame and its input/resize/close events;
-it does not lease or render inside Shell3. It presents the existing controls,
-menus, breadcrumb, clipboard, minimap frame, and modals. The graph and minimap
-contents remain empty across reload, depth, and mount changes until the native
-pan renderer is ready. Escape, the menu close button, and Ctrl-Q close this frame.
-The terminal backend retains the complete graph and its terminal handoff.
+Both local Shell3 UI4 windows and SSH use the terminal backend and its
+terminal lease. The old native `ui4` renderer has been retired; requesting it
+returns an unsupported-backend error. Renderer selection does not identify
+whether the active terminal is local or remote.
+
+Edit action
+-----------
+Select one `.txt` file in a local UI4 Shell3 window to reveal `edit` at the top
+of the Action list. It launches the built-in `edit` Blueprint in a separate
+Shell3 window, leaving termdir open. The child receives a one-shot runscript:
+
+    fs-scope trueosfs
+    open trueosfs:discN/path/to/note.txt
+
+The `open` directive treats the remainder of its line as a literal filename,
+including spaces. Filenames containing line breaks cannot use this action.
+The live `vFile:terminal-frontend` query distinguishes `ui4`, `remote`, and
+`detached`; termdir refreshes it on terminal re-entry and before launching.
+The action is hidden on SSH and for multiple selections, folders, and other
+extensions. Remote editor handoff is not implemented by this action.
 
 Dependency policy: std + crossterm only.
 
